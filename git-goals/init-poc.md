@@ -1,0 +1,1 @@
+Design and implement a PoC toy hardware wallet for XIAO RP2040 in Rust, as a microkernel demonstration
