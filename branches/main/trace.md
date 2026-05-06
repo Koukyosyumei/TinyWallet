@@ -68,3 +68,4 @@ _[Checkpoint: 69fbcadc — wrote scripts/build-uf2.sh; wrote .cargo/config.toml;
 [23:16:50] OBSERVE: read README.md
 [23:17:18] ACT: wrote README.md
 [23:17:29] ACT: Replaced probe-rs runner with scripts/build-uf2.sh wrapping elf2uf2-rs. cargo run --release now produces ./tiny-wallet.uf2 in project root for WSL→Windows drag-drop flashing.
+[23:17:29] ACT: Added kernel gpio module driving XIAO RP2040's three simple-GPIO LEDs (R=17 G=16 B=25, active low). SysTick toggles green; HardFault sets red solid; new SYSCALL_LED lets user task drive blue. Iter-5 deliberate fault changed from random SIO write to 'try to drive blue LED directly bypassing syscall' — same MPU trap, better narrative. README rewritten with architecture diagram + LED meaning table.
