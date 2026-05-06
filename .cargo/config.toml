@@ -1,5 +1,12 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-runner = "probe-rs run --chip RP2040"
+# `cargo run --release` builds the ELF and converts it to ./tiny-wallet.uf2
+# at the project root. The previous probe-rs runner is commented out — it
+# requires a debug probe (picoprobe / DAPLink) and udev rules, which we
+# don't have in this WSL setup. Re-enable it later if you wire up SWD.
+#
+# runner = "probe-rs run --chip RP2040"
+runner = "./scripts/build-uf2.sh"
+
 [build]
 target = "thumbv6m-none-eabi"
 
