@@ -10,11 +10,13 @@ Design and implement a PoC toy hardware wallet for XIAO RP2040 in Rust, as a mic
 - [x] edited src/main.rs; edited src/main.rs; edited Cargo.toml/build.rs/memory.x/boot2.x/src/main.rs: dropped embassy stack, …
 - [x] edited src/main.rs; edited src/main.rs; edited Cargo.toml/build.rs/memory.x/boot2.x/src/main.rs: dropped embassy stack, …
 - [x] wrote scripts/build-uf2.sh; wrote .cargo/config.toml; edited .gitignore
+- [x] Phase 1.5: LED observability + UF2 build flow
 
 ## Active Branches
 - main (primary)
 
 ## Notes
+- [2026-05-06 23:17 UTC] `main`: Phase 1.5: LED observability + UF2 build flow
 - [2026-05-06 23:12 UTC] `main`: wrote scripts/build-uf2.sh; wrote .cargo/config.toml; edited .gitignore
 - [2026-05-06 23:04 UTC] `main`: edited src/main.rs; edited src/main.rs; edited Cargo.toml/build.rs/memory.x/boot2.x/src/main.rs: dropped embassy stack, …
 - [2026-05-06 22:59 UTC] `main`: edited src/main.rs; edited src/main.rs; edited Cargo.toml/build.rs/memory.x/boot2.x/src/main.rs: dropped embassy stack, …
