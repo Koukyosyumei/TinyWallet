@@ -82,3 +82,9 @@ _[Checkpoint: 69fbcc17 — wrote README.md; Replaced probe-rs runner with script
 ---
 
 [23:19:16] OBSERVE: User confirmed Phase 1 PoC works on real XIAO RP2040 hardware. All three predicted LED behaviors observed: green heartbeat, blue syscall toggle, red HardFault on MPU violation at iter 5. The MPU enforcement is real, not theoretical.
+
+
+---
+_[Checkpoint: 69fbcc74 — Phase 1 hardware-validated]_
+---
+

@@ -95,3 +95,16 @@ PoC now demonstrable on bare XIAO + USB cable, no probe needed. Visible signals:
 
 ---
 
+## Commit 69fbcc74 — 2026-05-06 23:19 UTC
+
+### Branch Purpose
+Primary development branch
+
+### Previous Progress Summary
+
+
+### This Commit's Contribution
+End-to-end flow confirmed on bare XIAO + USB: kernel boot → MPU config → privilege drop to user task → SVC round-trip → MPU traps direct SIO write → HardFault handler + red LED. Ready to build Phase 2 (task table, PendSV context switch, syscall pointer validation) on this foundation.
+
+---
+

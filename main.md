@@ -12,11 +12,13 @@ Design and implement a PoC toy hardware wallet for XIAO RP2040 in Rust, as a mic
 - [x] wrote scripts/build-uf2.sh; wrote .cargo/config.toml; edited .gitignore
 - [x] Phase 1.5: LED observability + UF2 build flow
 - [x] wrote README.md; Replaced probe-rs runner with scripts/build-uf2.sh wrapping elf2uf2-rs. cargo run --release now produce…
+- [x] Phase 1 hardware-validated
 
 ## Active Branches
 - main (primary)
 
 ## Notes
+- [2026-05-06 23:19 UTC] `main`: Phase 1 hardware-validated
 - [2026-05-06 23:17 UTC] `main`: wrote README.md; Replaced probe-rs runner with scripts/build-uf2.sh wrapping elf2uf2-rs. cargo run --release now produce…
 - [2026-05-06 23:17 UTC] `main`: Phase 1.5: LED observability + UF2 build flow
 - [2026-05-06 23:12 UTC] `main`: wrote scripts/build-uf2.sh; wrote .cargo/config.toml; edited .gitignore
