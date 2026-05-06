@@ -35,3 +35,9 @@ _[Checkpoint: 69fbc44c — wrote Cargo.toml]_
 _[Checkpoint: 69fbc7c5 — Phase 1 PoC: MPU-enforced microkernel boots, drops to user task, SVC round-trip, MPU isolation demo]_
 ---
 
+
+
+---
+_[Checkpoint: 69fbc7d9 — edited src/main.rs; edited src/main.rs; edited Cargo.toml/build.rs/memory.x/boot2.x/src/main.rs: dropped embassy stack, …]_
+---
+
