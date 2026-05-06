@@ -108,3 +108,16 @@ End-to-end flow confirmed on bare XIAO + USB: kernel boot → MPU config → pri
 
 ---
 
+## Commit 69fbcf0a — 2026-05-06 23:30 UTC
+
+### Branch Purpose
+Primary development branch
+
+### Previous Progress Summary
+End-to-end flow confirmed on bare XIAO + USB: kernel boot → MPU config → privilege drop to user task → SVC round-trip → MPU traps direct SIO write → HardFault handler + red LED. Ready to build Phase 2 (task table, PendSV context switch, syscall pointer validation) on this foundation.
+
+### This Commit's Contribution
+
+
+---
+
