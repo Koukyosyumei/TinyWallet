@@ -17,3 +17,4 @@ _[Checkpoint: 69fbc44c — wrote Cargo.toml]_
 [22:47:34] OBSERVE: Confirmed RP2040 has MPU (8 regions) via pico-sdk m0plus.h header. User flagged uncertainty; verified before proceeding.
 [22:47:35] ACT: wrote feedback_verify_chip_features.md
 [22:47:41] ACT: wrote MEMORY.md
+[22:51:34] OBSERVE: read mpu.rs
