@@ -47,3 +47,4 @@ _[Checkpoint: 69fbc7d9 — edited src/main.rs; edited src/main.rs; edited Cargo.
 _[Checkpoint: 69fbc918 — edited src/main.rs; edited src/main.rs; edited Cargo.toml/build.rs/memory.x/boot2.x/src/main.rs: dropped embassy stack, …]_
 ---
 
+[23:11:36] ACT: wrote scripts/build-uf2.sh
