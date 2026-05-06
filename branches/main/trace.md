@@ -75,3 +75,9 @@ _[Checkpoint: 69fbcadc — wrote scripts/build-uf2.sh; wrote .cargo/config.toml;
 _[Checkpoint: 69fbcc09 — Phase 1.5: LED observability + UF2 build flow]_
 ---
 
+
+
+---
+_[Checkpoint: 69fbcc17 — wrote README.md; Replaced probe-rs runner with scripts/build-uf2.sh wrapping elf2uf2-rs. cargo run --release now produce…]_
+---
+

@@ -82,3 +82,16 @@ PoC now demonstrable on bare XIAO + USB cable, no probe needed. Visible signals:
 
 ---
 
+## Commit 69fbcc17 — 2026-05-06 23:17 UTC
+
+### Branch Purpose
+Primary development branch
+
+### Previous Progress Summary
+PoC now demonstrable on bare XIAO + USB cable, no probe needed. Visible signals: green blink = kernel alive; blue toggle = SVC works; red solid = MPU enforced. Untested on hardware — needs user to flash and confirm the predicted LED sequence.
+
+### This Commit's Contribution
+
+
+---
+
