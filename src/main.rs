@@ -97,6 +97,33 @@ fn sys_set_led(which: u32, on: bool) {
 // Anything else — kernel RAM, peripherals — should fault.
 extern "C" fn task0_main() -> ! {
     sys_print(b"hello from user task");
+
+    // Phase 2A demo: ask the kernel to print a buffer that points into
+    // *kernel* RAM (not in any of this task's allowed regions). The kernel
+    // must reject this — otherwise we have a confused-deputy bug.
+    //
+    // Visible signal on success (rejection): five fast blue pulses before
+    // the normal slow toggle starts. Distinguishable from:
+    //   - solid red       (HardFault — MPU caught a direct access)
+    //   - slow blue blink (normal user-task heartbeat)
+    //
+    // If the burst is missing and we go straight to the slow blink, the
+    // kernel accepted a pointer it should have rejected — a real bug.
+    let kernel_ram_addr: u32 = 0x2000_0000;
+    let result = syscall2(SYSCALL_PRINT, kernel_ram_addr, 16);
+    if result == u32::MAX {
+        for _ in 0..5 {
+            sys_set_led(2, true);
+            for _ in 0..50_000 {
+                unsafe { core::arch::asm!("nop") };
+            }
+            sys_set_led(2, false);
+            for _ in 0..50_000 {
+                unsafe { core::arch::asm!("nop") };
+            }
+        }
+    }
+
     let mut counter: u32 = 0;
     loop {
         // Visible heartbeat from the user side: toggle the blue LED via
@@ -197,6 +224,91 @@ mod gpio {
 }
 
 // =============================================================================
+// Kernel: tasks
+// =============================================================================
+//
+// A task carries the same (base, size, perms) region list that's programmed
+// into the MPU for it. The kernel uses this list to validate user-supplied
+// pointers in syscalls — without it, a malicious task could pass a kernel
+// pointer to SYSCALL_PRINT and have the kernel exfiltrate kernel memory on
+// the task's behalf (the "confused deputy" pattern).
+//
+// Phase 2A: one hardcoded task. Phase 2B will introduce a real table.
+mod task {
+    pub const PERM_R: u8 = 1 << 0;
+    pub const PERM_W: u8 = 1 << 1;
+    pub const PERM_X: u8 = 1 << 2;
+    pub const PERM_RW: u8 = PERM_R | PERM_W;
+    pub const PERM_RX: u8 = PERM_R | PERM_X;
+
+    #[derive(Clone, Copy)]
+    pub struct TaskRegion {
+        pub base: u32,
+        pub size: u32,
+        pub perms: u8,
+    }
+
+    pub struct Task {
+        pub regions: [TaskRegion; 4],
+    }
+
+    const EMPTY: TaskRegion = TaskRegion { base: 0, size: 0, perms: 0 };
+
+    pub static mut TASKS: [Task; 1] = [Task {
+        regions: [EMPTY; 4],
+    }];
+
+    /// Populate task 0 with the regions matching what we hand to the MPU.
+    /// Called once from kernel `main()` before privilege drop.
+    pub fn init_task0(task_ram_base: u32) {
+        // SAFETY: called once at boot before any code can read TASKS.
+        unsafe {
+            let t = &raw mut TASKS[0];
+            (*t).regions[0] = TaskRegion {
+                base: task_ram_base,
+                size: 8 * 1024,
+                perms: PERM_RW,
+            };
+            (*t).regions[1] = TaskRegion {
+                base: 0x1000_0000,
+                size: 16 * 1024 * 1024,
+                perms: PERM_RX,
+            };
+        }
+    }
+
+    /// PoC: only one task exists. Phase 2C will replace this with a
+    /// scheduler-tracked index.
+    pub fn current() -> &'static Task {
+        // SAFETY: TASKS is only mutated by init_task0 at boot. After that
+        // it's read-only for the lifetime of the program (Phase 2A scope).
+        unsafe { &*(&raw const TASKS[0]) }
+    }
+
+    /// Returns true iff `[ptr, ptr+len)` is fully inside one of the task's
+    /// regions and that region grants the access in `need`.
+    pub fn validate_buf(task: &Task, ptr: u32, len: u32, need: u8) -> bool {
+        let end = match ptr.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        for r in &task.regions {
+            if r.size == 0 {
+                continue;
+            }
+            let r_end = match r.base.checked_add(r.size) {
+                Some(e) => e,
+                None => continue,
+            };
+            if ptr >= r.base && end <= r_end && (r.perms & need) == need {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// =============================================================================
 // Kernel: MPU
 // =============================================================================
 mod mpu_cfg {
@@ -272,11 +384,19 @@ use mpu_cfg::{
 // =============================================================================
 
 fn syscall_print(ptr: u32, len: u32) -> u32 {
-    // PoC: trust the caller's pointer/len. Phase 2 will validate the
-    // (ptr, len) range against the calling task's granted MPU regions
-    // before dereferencing — otherwise a user task could trick the kernel
-    // into reading arbitrary memory ("confused deputy").
     if len > 256 {
+        return u32::MAX;
+    }
+    // Validate the user-supplied buffer is inside the calling task's regions
+    // before dereferencing — closes the confused-deputy hole. Without this
+    // check, the user task could pass a kernel pointer and have us read
+    // kernel memory on its behalf.
+    if !task::validate_buf(task::current(), ptr, len, task::PERM_R) {
+        defmt::warn!(
+            "kernel: rejected SYSCALL_PRINT — buf not in caller's regions (ptr=0x{:08x} len={})",
+            ptr,
+            len,
+        );
         return u32::MAX;
     }
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
@@ -408,6 +528,11 @@ fn main() -> ! {
     };
     configure(&cp.MPU, &[task0_region, flash_region]);
     defmt::info!("kernel: MPU configured (2 regions: task0 RAM, flash RX)");
+
+    // ---- 1b. Mirror the MPU regions into the task table so syscall ----
+    // ---- handlers can validate user-supplied pointers.            ----
+    task::init_task0(task_ram_base);
+    defmt::info!("kernel: task0 region table populated");
 
     // ---- 2. SysTick heartbeat (~1 Hz off uncalibrated boot ROSC) ----
     cp.SYST.set_clock_source(SystClkSource::Core);
