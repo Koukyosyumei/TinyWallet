@@ -88,3 +88,4 @@ _[Checkpoint: 69fbcc17 — wrote README.md; Replaced probe-rs runner with script
 _[Checkpoint: 69fbcc74 — Phase 1 hardware-validated]_
 ---
 
+[23:28:18] OBSERVE: read src/main.rs
