@@ -50,3 +50,4 @@ _[Checkpoint: 69fbc918 — edited src/main.rs; edited src/main.rs; edited Cargo.
 [23:11:36] ACT: wrote scripts/build-uf2.sh
 [23:11:54] ACT: wrote .cargo/config.toml
 [23:12:01] OBSERVE: read .gitignore
+[23:12:04] ACT: edited .gitignore
