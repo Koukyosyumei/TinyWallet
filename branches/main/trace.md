@@ -28,3 +28,4 @@ _[Checkpoint: 69fbc44c — wrote Cargo.toml]_
 [22:54:38] ACT: edited src/main.rs
 [22:54:42] ACT: edited src/main.rs
 [22:54:44] ACT: edited src/main.rs
+[22:59:17] ACT: edited Cargo.toml/build.rs/memory.x/boot2.x/src/main.rs: dropped embassy stack, switched to cortex-m-rt + rp2040-boot2 + cortex-m (with critical-section-single-core for defmt). Wrote Phase 1 microkernel: MPU setup (2 regions: task0 RAM RW unpriv, flash RX both), PSP drop to unprivileged thread mode via inline asm, SVCall handler dispatching SYSCALL_PRINT, SysTick heartbeat, HardFault handler. Single user task that prints via syscall and deliberately faults on iteration 5 to demo MPU enforcement.
