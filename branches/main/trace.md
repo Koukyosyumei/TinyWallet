@@ -4,3 +4,4 @@
 [22:36:42] OBSERVE: read Cargo.toml
 [22:36:42] OBSERVE: read src/main.rs
 [22:36:42] OBSERVE: read build.rs
+[22:36:43] OBSERVE: read memory.x
