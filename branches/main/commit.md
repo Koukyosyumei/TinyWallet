@@ -641,3 +641,16 @@ salty Keypair + sign over IPC; diagnosed rp2040-hal bootrom AEABI helpers as com
 
 ---
 
+## Commit 69fc847e — 2026-05-07 12:24 UTC
+
+### Branch Purpose
+Primary development branch
+
+### Previous Progress Summary
+salty Keypair + sign over IPC; diagnosed rp2040-hal bootrom AEABI helpers as common cause of mysterious HardFaults under crypto code; disable-intrinsics applied but not yet hardware-validated. README updated with full status table + roadmap; two new feedback memories pinned. Resume by flashing tiny-wallet.uf2 and testing printf 'p\n'.
+
+### This Commit's Contribution
+
+
+---
+

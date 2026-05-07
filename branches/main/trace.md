@@ -440,3 +440,9 @@ _[Checkpoint: 69fc827f — edited src/main.rs; edited Cargo.toml; edited Cargo.t
 _[Checkpoint: 69fc8320 — Phase 4A WIP: vault task + ed25519 + AEABI bootrom diagnosis]_
 ---
 
+
+
+---
+_[Checkpoint: 69fc847e — edited MEMORY.md; wrote README.md; Phase 4A vault built (salty ed25519 keypair, IPC-driven get-pubkey + sign). Diagnosed…]_
+---
+

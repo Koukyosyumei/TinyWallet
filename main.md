@@ -54,11 +54,13 @@ Design and implement a PoC toy hardware wallet for XIAO RP2040 in Rust, as a mic
 - [x] edited Cargo.toml; edited src/main.rs; edited Cargo.toml
 - [x] edited src/main.rs; edited Cargo.toml; edited Cargo.toml
 - [x] Phase 4A WIP: vault task + ed25519 + AEABI bootrom diagnosis
+- [x] edited MEMORY.md; wrote README.md; Phase 4A vault built (salty ed25519 keypair, IPC-driven get-pubkey + sign). Diagnosed…
 
 ## Active Branches
 - main (primary)
 
 ## Notes
+- [2026-05-07 12:24 UTC] `main`: edited MEMORY.md; wrote README.md; Phase 4A vault built (salty ed25519 keypair, IPC-driven get-pubkey + sign). Diagnosed…
 - [2026-05-07 12:18 UTC] `main`: Phase 4A WIP: vault task + ed25519 + AEABI bootrom diagnosis
 - [2026-05-07 12:15 UTC] `main`: edited src/main.rs; edited Cargo.toml; edited Cargo.toml
 - [2026-05-07 04:29 UTC] `main`: edited Cargo.toml; edited src/main.rs; edited Cargo.toml
