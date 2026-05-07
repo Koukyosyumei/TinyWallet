@@ -51,6 +51,7 @@ pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 struct TaskRam(#[allow(dead_code)] [u8; 8192]);
 
 static mut TASK0_RAM: TaskRam = TaskRam([0; 8192]);
+static mut TASK1_RAM: TaskRam = TaskRam([0; 8192]);
 
 // =============================================================================
 // Syscall ABI
@@ -62,6 +63,7 @@ static mut TASK0_RAM: TaskRam = TaskRam([0; 8192]);
 
 const SYSCALL_PRINT: u32 = 1;
 const SYSCALL_LED: u32 = 2;
+const SYSCALL_YIELD: u32 = 3;
 
 #[inline(always)]
 fn syscall2(num: u32, a1: u32, a2: u32) -> u32 {
@@ -87,6 +89,12 @@ fn sys_set_led(which: u32, on: bool) {
     syscall2(SYSCALL_LED, which, on as u32);
 }
 
+/// Cooperative yield: kernel pends PendSV, which (after this SVC returns)
+/// switches to the next ready task. Returns when this task is rescheduled.
+fn sys_yield() {
+    syscall2(SYSCALL_YIELD, 0, 0);
+}
+
 // =============================================================================
 // User task
 // =============================================================================
@@ -96,60 +104,30 @@ fn sys_set_led(which: u32, on: bool) {
 //   - read+write    its own 8 KiB RAM (TASK0_RAM)
 // Anything else — kernel RAM, peripherals — should fault.
 extern "C" fn task0_main() -> ! {
-    sys_print(b"hello from user task");
-
-    // Phase 2A demo: ask the kernel to print a buffer that points into
-    // *kernel* RAM (not in any of this task's allowed regions). The kernel
-    // must reject this — otherwise we have a confused-deputy bug.
-    //
-    // Visible signal on success (rejection): five fast blue pulses before
-    // the normal slow toggle starts. Distinguishable from:
-    //   - solid red       (HardFault — MPU caught a direct access)
-    //   - slow blue blink (normal user-task heartbeat)
-    //
-    // If the burst is missing and we go straight to the slow blink, the
-    // kernel accepted a pointer it should have rejected — a real bug.
-    let kernel_ram_addr: u32 = 0x2000_0000;
-    let result = syscall2(SYSCALL_PRINT, kernel_ram_addr, 16);
-    if result == u32::MAX {
-        for _ in 0..5 {
-            sys_set_led(2, true);
-            for _ in 0..50_000 {
-                unsafe { core::arch::asm!("nop") };
-            }
-            sys_set_led(2, false);
-            for _ in 0..50_000 {
-                unsafe { core::arch::asm!("nop") };
-            }
-        }
-    }
-
+    sys_print(b"hello from task0");
     let mut counter: u32 = 0;
     loop {
-        // Visible heartbeat from the user side: toggle the blue LED via
-        // syscall. If the SVC round-trip works, blue blinks; if it doesn't,
-        // blue stays whatever it was. Either way the green kernel-heartbeat
-        // is independent.
-        sys_set_led(2, counter & 1 == 0);
+        sys_set_led(2, counter & 1 == 0); // blue
         counter = counter.wrapping_add(1);
-
-        // Crude busy-wait between toggles.
         for _ in 0..400_000 {
             unsafe { core::arch::asm!("nop") };
         }
+        sys_yield();
+    }
+}
 
-        // Phase-1 isolation demo: after a few iterations, deliberately try
-        // to drive the blue LED *directly* by writing to the SIO peripheral
-        // — bypassing the syscall. The MPU should deny this (peripherals
-        // aren't in the user task's MPU view), the HardFault handler should
-        // turn the red LED on solid, and the board should hang.
-        if counter == 5 {
-            sys_print(b"about to bypass the syscall and write SIO directly");
-            unsafe {
-                let sio_gpio_out_clr = 0xD000_0018 as *mut u32;
-                sio_gpio_out_clr.write_volatile(1 << 25); // would turn blue on
-            }
+extern "C" fn task1_main() -> ! {
+    sys_print(b"hello from task1");
+    let mut counter: u32 = 0;
+    loop {
+        sys_set_led(1, counter & 1 == 0); // green
+        counter = counter.wrapping_add(1);
+        // Different busy-wait length than task 0, so the rates visibly
+        // differ when both tasks are alive.
+        for _ in 0..600_000 {
+            unsafe { core::arch::asm!("nop") };
         }
+        sys_yield();
     }
 }
 
@@ -175,7 +153,6 @@ mod gpio {
     const SIO_BASE: u32 = 0xD000_0000;
     const SIO_GPIO_OUT_SET: u32 = SIO_BASE + 0x014;
     const SIO_GPIO_OUT_CLR: u32 = SIO_BASE + 0x018;
-    const SIO_GPIO_OUT_XOR: u32 = SIO_BASE + 0x01C;
     const SIO_GPIO_OE_SET: u32 = SIO_BASE + 0x024;
 
     pub const LED_RED: u32 = 17;
@@ -217,10 +194,6 @@ mod gpio {
             write(SIO_GPIO_OUT_SET, 1 << pin);
         }
     }
-
-    pub fn toggle(pin: u32) {
-        write(SIO_GPIO_OUT_XOR, 1 << pin);
-    }
 }
 
 // =============================================================================
@@ -252,31 +225,49 @@ mod task {
         /// Function pointer the kernel jumps to when first running this task.
         pub entry_pc: u32,
         /// Initial PSP value (top of the task's stack, 8-byte aligned).
-        /// Phase 2C will replace this with a saved PSP across context switches.
+        /// Used only by `bootstrap_user` for the first task; thereafter
+        /// `saved_psp` carries the actual SP across context switches.
         pub initial_psp: u32,
+        /// PSP value at the most recent suspension. For task 0, undefined
+        /// until its first yield. For task 1+, init code seeds this to point
+        /// at a fake exception frame so the first PendSV restore lands at
+        /// `entry_pc` cleanly.
+        pub saved_psp: u32,
         /// MPU regions granted to this task, mirrored for syscall pointer
         /// validation. Empty entries (size == 0) are skipped.
         pub regions: [TaskRegion; 4],
     }
 
+    pub const N_TASKS: usize = 2;
+
     const EMPTY: TaskRegion = TaskRegion { base: 0, size: 0, perms: 0 };
     const EMPTY_TASK: Task = Task {
         entry_pc: 0,
         initial_psp: 0,
+        saved_psp: 0,
         regions: [EMPTY; 4],
     };
 
-    pub static mut TASKS: [Task; 1] = [EMPTY_TASK];
+    pub static mut TASKS: [Task; N_TASKS] = [EMPTY_TASK; N_TASKS];
 
-    /// Populate task 0. Called once from kernel `main()` before privilege drop.
-    /// `ram_base` must be aligned to `ram_size` (MPU requirement); `ram_size`
-    /// must be a power of two ≥ 32.
+    /// Index of the task that's currently executing in user mode. Updated
+    /// by PendSV during a context switch. Read by syscall handlers (so
+    /// `validate_buf` checks against the right task's regions) and by
+    /// PendSV (to know which slot to save the outgoing PSP into).
+    pub static mut CURRENT_TASK: usize = 0;
+
+    /// Populate task 0. Bootstraps via `bootstrap_user` so it doesn't need
+    /// a fake initial exception frame — kernel `main()` calls
+    /// `bootstrap_user(task0)` directly which loads `initial_psp` and `bx`s
+    /// to `entry_pc`. After task 0's first yield, `saved_psp` is set by
+    /// PendSV and `initial_psp` is no longer read.
     pub fn init_task0(entry_pc: u32, ram_base: u32, ram_size: u32) {
         // SAFETY: called once at boot before any code can read TASKS.
         unsafe {
             let t = &raw mut TASKS[0];
             (*t).entry_pc = entry_pc;
             (*t).initial_psp = (ram_base + ram_size) & !7;
+            (*t).saved_psp = 0; // unused until first yield
             (*t).regions[0] = TaskRegion {
                 base: ram_base,
                 size: ram_size,
@@ -290,12 +281,79 @@ mod task {
         }
     }
 
-    /// PoC: only one task exists. Phase 2C will replace this with a
-    /// scheduler-tracked index.
+    /// Populate task 1+. Unlike task 0, this task's first run goes through
+    /// PendSV's restore path — so we pre-seed the task's stack with a
+    /// well-formed exception frame plus 32 bytes of zeros for r4-r11. When
+    /// PendSV pops both, the hardware exception-return lands at `entry_pc`
+    /// in unprivileged thread mode.
+    ///
+    /// Stack layout (grows down from `top`):
+    ///
+    /// ```text
+    /// top         ──────────────  PSP after first run resumes
+    ///   -4   xpsr  = 0x01000000
+    ///   -8   pc    = entry_pc
+    ///   -12  lr    = 0
+    ///   -16  r12   = 0
+    ///   -20  r3    = 0
+    ///   -24  r2    = 0
+    ///   -28  r1    = 0
+    ///   -32  r0    = 0
+    ///   -36..-64  r4-r11 = zeros   ── PendSV pops these first
+    /// saved_psp  ──────────────  initial PSP value PendSV sees
+    /// ```
+    pub fn init_task1(slot: usize, entry_pc: u32, ram_base: u32, ram_size: u32) {
+        // SAFETY: called once at boot, single-threaded. Writes into the
+        // task's RAM via privileged kernel access (PRIVDEFENA=1 in MPU).
+        unsafe {
+            let t = &raw mut TASKS[slot];
+            (*t).entry_pc = entry_pc;
+            let top = (ram_base + ram_size) & !7;
+            (*t).initial_psp = top;
+
+            // Fake exception frame at top-32 .. top.
+            let frame_base = top - 32;
+            (frame_base as *mut u32).add(0).write_volatile(0); // r0
+            (frame_base as *mut u32).add(1).write_volatile(0); // r1
+            (frame_base as *mut u32).add(2).write_volatile(0); // r2
+            (frame_base as *mut u32).add(3).write_volatile(0); // r3
+            (frame_base as *mut u32).add(4).write_volatile(0); // r12
+            (frame_base as *mut u32).add(5).write_volatile(0); // lr
+            (frame_base as *mut u32).add(6).write_volatile(entry_pc); // pc
+            (frame_base as *mut u32).add(7).write_volatile(0x0100_0000); // xpsr (T bit)
+
+            // Zeros for r4-r11 at top-64 .. top-32.
+            let saved_psp = top - 64;
+            for i in 0..8 {
+                (saved_psp as *mut u32).add(i).write_volatile(0);
+            }
+            (*t).saved_psp = saved_psp;
+
+            (*t).regions[0] = TaskRegion {
+                base: ram_base,
+                size: ram_size,
+                perms: PERM_RW,
+            };
+            (*t).regions[1] = TaskRegion {
+                base: 0x1000_0000,
+                size: 16 * 1024 * 1024,
+                perms: PERM_RX,
+            };
+        }
+    }
+
+    /// Returns the task currently running in user mode (per CURRENT_TASK).
+    /// Read from kernel context (syscall handlers, PendSV) — never from a
+    /// user task directly.
     pub fn current() -> &'static Task {
-        // SAFETY: TASKS is only mutated by init_task0 at boot. After that
-        // it's read-only for the lifetime of the program (Phase 2A scope).
-        unsafe { &*(&raw const TASKS[0]) }
+        // SAFETY: CURRENT_TASK is written only by PendSV (one writer) and
+        // read by handlers that run with PendSV preempted/disabled, so
+        // there's no torn-read race in this PoC. TASKS is initialized once
+        // at boot.
+        unsafe {
+            let idx = CURRENT_TASK;
+            &*(&raw const TASKS[idx])
+        }
     }
 
     /// Returns true iff `[ptr, ptr+len)` is fully inside one of the task's
@@ -364,7 +422,14 @@ mod mpu_cfg {
         }
     }
 
-    pub fn configure(mpu: &MPU, regions: &[Region]) {
+    pub fn configure(regions: &[Region]) {
+        // Use the static MPU pointer rather than a borrowed `&MPU` handle.
+        // Callers like the PendSV context-switch path don't have access to
+        // the cortex-m Peripherals struct (it was consumed at boot), and
+        // there's only ever one MPU on the chip.
+        // SAFETY: kernel-only, single-threaded with respect to MPU register
+        // writes (PendSV is the only runtime caller; boot is single-threaded).
+        let mpu = unsafe { &*MPU::PTR };
         unsafe {
             // Disable while we reconfigure.
             mpu.ctrl.write(0);
@@ -447,6 +512,14 @@ unsafe fn SVCall() {
     let ret = match num {
         SYSCALL_PRINT => syscall_print(a1, a2),
         SYSCALL_LED => syscall_led(a1, a2),
+        SYSCALL_YIELD => {
+            // Pend PendSV. Because PendSV is configured to lowest priority,
+            // it fires *after* this SVC's exception return — at which point
+            // PSP is back to the user task's pre-SVC stack, which is what
+            // we want PendSV to save.
+            cortex_m::peripheral::SCB::set_pendsv();
+            0
+        }
         _ => {
             defmt::warn!("kernel: unknown syscall {}", num);
             u32::MAX
@@ -471,11 +544,12 @@ static KERNEL_TICKS: AtomicU32 = AtomicU32::new(0);
 fn SysTick() {
     // Plain load+store on AtomicU32 — M0+ lacks CAS, but Relaxed load/store
     // compile to LDR/STR, which is sufficient since SysTick is the only
-    // writer.
+    // writer. Phase 2C: SysTick no longer drives any LED — task 1 owns
+    // green via SYSCALL_LED. SysTick stays armed for timing reference and
+    // as the future preemption hook (Phase 2D could pend PendSV here for
+    // round-robin preemption).
     let n = KERNEL_TICKS.load(Ordering::Relaxed).wrapping_add(1);
     KERNEL_TICKS.store(n, Ordering::Relaxed);
-    // Visible heartbeat: green LED toggles every tick (~0.5 Hz blink).
-    gpio::toggle(gpio::LED_GREEN);
     if n % 5 == 0 {
         defmt::info!("kernel: heartbeat tick={}", n);
     }
@@ -506,6 +580,136 @@ unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
     loop {
         cortex_m::asm::wfi();
     }
+}
+
+// =============================================================================
+// Kernel: per-task MPU reprogramming (used on context switch)
+// =============================================================================
+//
+// Each Task carries generic R/W/X permission bits in its TaskRegion list.
+// On switch, those need to be translated to the RP2040's RASR encoding
+// (AP field, XN bit) and written to MPU regions 0..N. PRIVDEFENA stays
+// on so kernel-mode access is unaffected.
+
+fn perms_to_rasr_attrs(perms: u8) -> u32 {
+    let mut attrs = RASR_MEM_NORMAL;
+    if perms & task::PERM_X == 0 {
+        attrs |= RASR_XN;
+    }
+    let r = perms & task::PERM_R != 0;
+    let w = perms & task::PERM_W != 0;
+    attrs |= match (r, w) {
+        (true, true) => RASR_AP_PRIV_RW_UNPRIV_RW,
+        (true, false) => RASR_AP_PRIV_RO_UNPRIV_RO,
+        _ => 0, // no-access (shouldn't happen for any granted region)
+    };
+    attrs
+}
+
+fn reconfigure_mpu_for_task(t: &task::Task) {
+    // Both tasks currently use exactly two regions (RAM + flash). When
+    // future tasks need more regions, generalize this.
+    let regions = [
+        Region {
+            number: 0,
+            base: t.regions[0].base,
+            size_bytes: t.regions[0].size,
+            attrs: perms_to_rasr_attrs(t.regions[0].perms),
+        },
+        Region {
+            number: 1,
+            base: t.regions[1].base,
+            size_bytes: t.regions[1].size,
+            attrs: perms_to_rasr_attrs(t.regions[1].perms),
+        },
+    ];
+    configure(&regions);
+}
+
+// =============================================================================
+// Kernel: PendSV — cooperative context switch
+// =============================================================================
+//
+// Triggered indirectly by SYSCALL_YIELD (which sets PENDSVSET). Because
+// PendSV is configured to the lowest priority, it runs after the
+// triggering SVC has fully exited — so when PendSV fires, PSP holds the
+// outgoing user task's true SP (no nested-exception frame on top).
+//
+// We can't write the body in plain Rust, because the cortex-m-rt
+// `#[exception]` macro generates a wrapper with a function preamble that
+// would clobber r4-r11 before we can save them. So PendSV is a fully
+// naked function that:
+//   1. Saves r4-r11 below the current PSP (Cortex-M0+ doesn't auto-save
+//      callee-saved registers on exception entry — only r0-r3, r12, lr,
+//      pc, xpsr).
+//   2. Calls a Rust helper (`pendsv_switch`) with the new low-water PSP
+//      as its argument; it returns the incoming task's saved PSP.
+//   3. Restores r4-r11 from the incoming task's PSP.
+//   4. Updates the PSP register and exception-returns. The hardware then
+//      pops the standard 8-word frame from the new PSP, jumping into
+//      the new task at its saved PC (or its entry point on first run).
+
+#[unsafe(no_mangle)]
+extern "C" fn pendsv_switch(outgoing_psp: u32) -> u32 {
+    // SAFETY: runs only inside the PendSV handler, which is the unique
+    // writer of CURRENT_TASK and the per-task saved_psp slots.
+    unsafe {
+        let cur = task::CURRENT_TASK;
+        let tasks = &raw mut task::TASKS;
+        (*tasks)[cur].saved_psp = outgoing_psp;
+
+        // Round-robin pick. Phase 2D could add Ready/Blocked states.
+        let next = (cur + 1) % task::N_TASKS;
+        task::CURRENT_TASK = next;
+
+        let next_task = &(*tasks)[next];
+        reconfigure_mpu_for_task(next_task);
+        next_task.saved_psp
+    }
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+pub unsafe extern "C" fn PendSV() {
+    core::arch::naked_asm!(
+        // ---- save r4-r11 below the outgoing PSP ----
+        "mrs   r0, psp",
+        "subs  r0, #32",
+        "stmia r0!, {{r4-r7}}",      // r4-r7 → [psp-32 .. psp-16]; r0 += 16
+        "mov   r4, r8",
+        "mov   r5, r9",
+        "mov   r6, r10",
+        "mov   r7, r11",
+        "stmia r0!, {{r4-r7}}",      // r8-r11 → [psp-16 .. psp]; r0 += 16
+        "subs  r0, #32",             // r0 = psp - 32 (the new low-water mark)
+
+        // ---- call into Rust to update CURRENT_TASK + reprogram MPU ----
+        "push  {{lr}}",              // preserve EXC_RETURN across the bl
+        "bl    pendsv_switch",
+        "pop   {{r1}}",
+        "mov   lr, r1",
+        // r0 = incoming task's saved_psp
+
+        // ---- restore r4-r11 from the incoming PSP ----
+        // CRITICAL: load the HIGH half first (saved r8-r11) using r4-r7 as
+        // temps and move into r8-r11; THEN load the LOW half (saved r4-r7)
+        // into r4-r7 directly. Doing it the other way around silently
+        // corrupts r4-r7 because the second ldmia overwrites them with the
+        // high-half values that should have gone to r8-r11.
+        "adds  r0, #16",             // r0 = saved_psp + 16 (start of high half)
+        "ldmia r0!, {{r4-r7}}",      // r4-r7 = saved r8,r9,r10,r11 (temps)
+        "mov   r8, r4",
+        "mov   r9, r5",
+        "mov   r10, r6",
+        "mov   r11, r7",
+        "subs  r0, #32",             // r0 = saved_psp (start of low half)
+        "ldmia r0!, {{r4-r7}}",      // r4-r7 = saved r4,r5,r6,r7 (final)
+        "adds  r0, #16",             // r0 = saved_psp + 32 (start of exception frame)
+
+        // ---- set PSP for the hardware exception return ----
+        "msr   psp, r0",
+        "bx    lr",                  // EXC_RETURN — HW pops the frame, runs new task
+    );
 }
 
 // =============================================================================
@@ -556,48 +760,48 @@ fn main() -> ! {
 
     // ---- 1. Populate the task table ----
     //
-    // The Task entry holds entry_pc / initial_psp / regions. Both MPU
-    // configuration and privilege-drop will read from it below, so the
-    // table is the single source of truth for "what is task 0".
+    // Each Task entry holds entry_pc / initial_psp / saved_psp / regions.
+    // Task 0 boots via `bootstrap_user` (uses initial_psp). Task 1 boots
+    // via PendSV's restore path on the first switch (uses saved_psp,
+    // which init_task1 seeds with a fake exception frame).
     let task0_ram_base = &raw const TASK0_RAM as u32;
-    let task0_ram_size: u32 = 8 * 1024;
+    let task1_ram_base = &raw const TASK1_RAM as u32;
+    let task_ram_size: u32 = 8 * 1024;
     defmt::info!(
-        "kernel: TASK0_RAM @ 0x{:08x} (size {} B)",
+        "kernel: TASK0_RAM @ 0x{:08x}, TASK1_RAM @ 0x{:08x} (each {} B)",
         task0_ram_base,
-        task0_ram_size,
+        task1_ram_base,
+        task_ram_size,
     );
     task::init_task0(
         task0_main as *const () as u32,
         task0_ram_base,
-        task0_ram_size,
+        task_ram_size,
+    );
+    task::init_task1(
+        1,
+        task1_main as *const () as u32,
+        task1_ram_base,
+        task_ram_size,
     );
 
-    // ---- 2. MPU (regions sourced from TASKS[0]) ----
-    //
-    // For now the MPU's RASR encoding is set inline; Phase 2C will move
-    // this into a `switch_to_task` helper that reprograms MPU on each
-    // context switch.
-    let t = task::current();
-    let mpu_regions = [
-        Region {
-            number: 0,
-            base: t.regions[0].base,
-            size_bytes: t.regions[0].size,
-            attrs: RASR_AP_PRIV_RW_UNPRIV_RW | RASR_MEM_NORMAL | RASR_XN,
-        },
-        Region {
-            number: 1,
-            base: t.regions[1].base,
-            size_bytes: t.regions[1].size,
-            // Read-only + executable for both privilege levels — user task
-            // needs to run its own code, which lives in flash.
-            attrs: RASR_AP_PRIV_RO_UNPRIV_RO | RASR_MEM_NORMAL,
-        },
-    ];
-    configure(&cp.MPU, &mpu_regions);
-    defmt::info!("kernel: MPU configured (2 regions: task0 RAM, flash RX)");
+    // ---- 2. MPU (start with task 0's view; PendSV reprograms on switch) ----
+    reconfigure_mpu_for_task(task::current());
+    defmt::info!("kernel: MPU configured for task 0");
 
-    // ---- 3. SysTick heartbeat (~1 Hz off uncalibrated boot ROSC) ----
+    // ---- 3. PendSV must be lowest priority so it never preempts SVCall ----
+    //
+    // We pend PendSV from inside the SVCall handler (via SYSCALL_YIELD).
+    // For PendSV to fire only *after* SVCall returns, its priority must be
+    // strictly lower than SVCall's. Setting it to 0xFF gives the lowest
+    // possible priority on M0+ (only the top 2 bits of priority are
+    // implemented, so 0xFF == 0xC0 == priority 3).
+    unsafe {
+        cp.SCB
+            .set_priority(cortex_m::peripheral::scb::SystemHandler::PendSV, 0xFF);
+    }
+
+    // ---- 4. SysTick heartbeat (~1 Hz off uncalibrated boot ROSC) ----
     cp.SYST.set_clock_source(SystClkSource::Core);
     cp.SYST.set_reload(6_500_000 - 1);
     cp.SYST.clear_current();
@@ -605,7 +809,8 @@ fn main() -> ! {
     cp.SYST.enable_interrupt();
     defmt::info!("kernel: SysTick armed");
 
-    // ---- 4. Drop to unprivileged thread mode and jump to user task ----
+    // ---- 5. Drop to unprivileged thread mode and jump to task 0 ----
+    let t = task::current();
     defmt::info!(
         "kernel: dropping to task0: entry=0x{:08x} PSP=0x{:08x}",
         t.entry_pc,
