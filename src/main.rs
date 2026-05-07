@@ -24,8 +24,21 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use core::mem::MaybeUninit;
+
 use cortex_m::peripheral::{Peripherals, syst::SystClkSource};
 use cortex_m_rt::{ExceptionFrame, entry, exception};
+use rp2040_hal::{
+    Watchdog,
+    clocks::init_clocks_and_plls,
+    pac::{self as hal_pac, interrupt},
+    usb::UsbBus,
+};
+use usb_device::{
+    bus::UsbBusAllocator,
+    device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid},
+};
+use usbd_serial::SerialPort;
 use {defmt_rtt as _, panic_probe as _};
 
 // =============================================================================
@@ -148,7 +161,8 @@ extern "C" fn task0_main() -> ! {
     loop {
         sys_set_led(2, counter & 1 == 0); // blue toggle
         counter = counter.wrapping_add(1);
-        for _ in 0..400_000 {
+        // Busy-wait sized for ~125 MHz core (was 400_000 at ~6.5 MHz).
+        for _ in 0..8_000_000 {
             unsafe { core::arch::asm!("nop") };
         }
         if counter.is_multiple_of(4) {
@@ -170,10 +184,128 @@ extern "C" fn task1_main() -> ! {
         let _ = sys_recv(&mut req_buf); // blocks until task 0 pings
         sys_set_led(1, counter & 1 == 0); // green toggle
         counter = counter.wrapping_add(1);
-        for _ in 0..200_000 {
+        // Busy-wait sized for ~125 MHz core (was 200_000 at ~6.5 MHz).
+        for _ in 0..4_000_000 {
             unsafe { core::arch::asm!("nop") };
         }
         sys_send(0, b"pong");
+    }
+}
+
+// =============================================================================
+// Kernel: USB-CDC (host-facing serial port)
+// =============================================================================
+//
+// Phase 3A: the USB driver lives entirely in privileged kernel code. The
+// host enumerates this device as a CDC-ACM (virtual serial port) at
+// /dev/ttyACMx (Linux/macOS) or COMx (Windows). The IRQ handler echoes
+// any bytes received back to the host.
+//
+// Phase 3B will replace the in-IRQ echo with a syscall path so a
+// user-space `host_io` task can read/write through the kernel.
+mod usb_io {
+    use super::*;
+
+    /// 12 MHz crystal on the XIAO RP2040.
+    const XTAL_FREQ_HZ: u32 = 12_000_000;
+
+    pub struct UsbState {
+        bus: MaybeUninit<UsbBusAllocator<UsbBus>>,
+        pub serial: MaybeUninit<SerialPort<'static, UsbBus>>,
+        pub device: MaybeUninit<UsbDevice<'static, UsbBus>>,
+    }
+
+    /// Backing storage for the USB stack. Initialized once at boot, then
+    /// owned exclusively by the USBCTRL_IRQ handler. SAFETY relies on
+    /// USBCTRL_IRQ being the only code that touches these slots after
+    /// `init` returns — no nested IRQ, no preemption-aware sharing.
+    pub static mut STATE: UsbState = UsbState {
+        bus: MaybeUninit::uninit(),
+        serial: MaybeUninit::uninit(),
+        device: MaybeUninit::uninit(),
+    };
+
+    /// Initialize system clocks (XOSC + PLL_SYS @ 125 MHz + PLL_USB @ 48 MHz)
+    /// and bring up the USB peripheral as a CDC-ACM device. Must be called
+    /// exactly once, before NVIC unmasks USBCTRL_IRQ.
+    pub fn init() {
+        let mut pac = hal_pac::Peripherals::take().unwrap();
+        let mut watchdog = Watchdog::new(pac.WATCHDOG);
+
+        // System clock setup. After this returns, the core is running at
+        // 125 MHz and PLL_USB is providing the 48 MHz USB clock.
+        let clocks = init_clocks_and_plls(
+            XTAL_FREQ_HZ,
+            pac.XOSC,
+            pac.CLOCKS,
+            pac.PLL_SYS,
+            pac.PLL_USB,
+            &mut pac.RESETS,
+            &mut watchdog,
+        )
+        .ok()
+        .expect("clock setup failed");
+
+        let usb_bus = UsbBusAllocator::new(UsbBus::new(
+            pac.USBCTRL_REGS,
+            pac.USBCTRL_DPRAM,
+            clocks.usb_clock,
+            true, // force VBUS detect
+            &mut pac.RESETS,
+        ));
+
+        // SAFETY: called exactly once at boot before USBCTRL_IRQ is
+        // unmasked, so there's no concurrent reader of STATE yet.
+        unsafe {
+            let bus_slot = &raw mut STATE.bus;
+            (*bus_slot).write(usb_bus);
+
+            // 'static reference to the bus allocator: cast through the raw
+            // pointer so the borrow checker accepts the 'static lifetime
+            // (the data really is in static storage and lives forever).
+            let bus_ref: &'static UsbBusAllocator<UsbBus> =
+                &*((&raw const STATE.bus) as *const UsbBusAllocator<UsbBus>);
+
+            let serial_slot = &raw mut STATE.serial;
+            (*serial_slot).write(SerialPort::new(bus_ref));
+
+            // VID 0x16c0 / PID 0x27dd is V-USB's shared test pair —
+            // appropriate for a hobbyist PoC. Replace before shipping.
+            let device = UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27dd))
+                .strings(&[StringDescriptors::default()
+                    .manufacturer("tiny-wallet")
+                    .product("tiny-wallet PoC")
+                    .serial_number("0001")])
+                .unwrap()
+                .device_class(usbd_serial::USB_CLASS_CDC)
+                .build();
+            let device_slot = &raw mut STATE.device;
+            (*device_slot).write(device);
+
+            cortex_m::peripheral::NVIC::unmask(hal_pac::Interrupt::USBCTRL_IRQ);
+        }
+    }
+}
+
+#[interrupt]
+fn USBCTRL_IRQ() {
+    // SAFETY: this IRQ is the unique writer of usb_io::STATE after init.
+    // It does not preempt itself (NVIC enforces), and PendSV/SysTick/SVCall
+    // never touch USB state.
+    unsafe {
+        let serial_slot = &raw mut usb_io::STATE.serial;
+        let device_slot = &raw mut usb_io::STATE.device;
+        let serial = (*serial_slot).assume_init_mut();
+        let device = (*device_slot).assume_init_mut();
+
+        if device.poll(&mut [serial]) {
+            let mut buf = [0u8; 64];
+            if let Ok(n) = serial.read(&mut buf) {
+                // Phase 3A: kernel-side echo. Phase 3B will route bytes
+                // through SYSCALL_USB_READ/WRITE to a user task instead.
+                let _ = serial.write(&buf[..n]);
+            }
+        }
     }
 }
 
@@ -982,6 +1114,15 @@ fn main() -> ! {
     gpio::init_leds();
     defmt::info!("kernel: LEDs initialized (R=17 G=16 B=25)");
 
+    // ---- 0.5. System clocks + USB-CDC ----
+    //
+    // After this call: core runs at 125 MHz (was ~6.5 MHz on boot ROSC),
+    // PLL_USB gives 48 MHz to the USB block, and the device enumerates as
+    // a CDC-ACM serial port. Must run before SysTick is configured because
+    // SysTick reload depends on the core clock.
+    usb_io::init();
+    defmt::info!("kernel: USB-CDC up (VID=0x16c0 PID=0x27dd)");
+
     // ---- 1. Populate the task table ----
     //
     // Each Task entry holds entry_pc / initial_psp / saved_psp / regions.
@@ -1025,9 +1166,9 @@ fn main() -> ! {
             .set_priority(cortex_m::peripheral::scb::SystemHandler::PendSV, 0xFF);
     }
 
-    // ---- 4. SysTick heartbeat (~1 Hz off uncalibrated boot ROSC) ----
+    // ---- 4. SysTick heartbeat (~1 Hz at 125 MHz core) ----
     cp.SYST.set_clock_source(SystClkSource::Core);
-    cp.SYST.set_reload(6_500_000 - 1);
+    cp.SYST.set_reload(125_000_000 - 1);
     cp.SYST.clear_current();
     cp.SYST.enable_counter();
     cp.SYST.enable_interrupt();

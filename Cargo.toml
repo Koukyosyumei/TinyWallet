@@ -20,8 +20,17 @@ panic-probe = { version = "1.0", features = ["print-defmt"] }
 cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7.3"
 
-# RP2040 boot stage 2 (just a 256-byte XIP setup blob; no PAC needed yet)
+# RP2040 boot stage 2 (just a 256-byte XIP setup blob)
 rp2040-boot2 = "0.3"
+
+# RP2040 HAL — used for clock setup (XOSC + PLLs) and the UsbBus
+# implementation. Don't enable `critical-section-impl` here; cortex-m
+# already provides one and only one impl is allowed.
+rp2040-hal = { version = "0.12", features = ["rt"] }
+
+# USB stack
+usb-device = "0.3"
+usbd-serial = "0.2"
 
 [profile.release]
 debug = 2
