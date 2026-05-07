@@ -249,24 +249,37 @@ mod task {
     }
 
     pub struct Task {
+        /// Function pointer the kernel jumps to when first running this task.
+        pub entry_pc: u32,
+        /// Initial PSP value (top of the task's stack, 8-byte aligned).
+        /// Phase 2C will replace this with a saved PSP across context switches.
+        pub initial_psp: u32,
+        /// MPU regions granted to this task, mirrored for syscall pointer
+        /// validation. Empty entries (size == 0) are skipped.
         pub regions: [TaskRegion; 4],
     }
 
     const EMPTY: TaskRegion = TaskRegion { base: 0, size: 0, perms: 0 };
-
-    pub static mut TASKS: [Task; 1] = [Task {
+    const EMPTY_TASK: Task = Task {
+        entry_pc: 0,
+        initial_psp: 0,
         regions: [EMPTY; 4],
-    }];
+    };
 
-    /// Populate task 0 with the regions matching what we hand to the MPU.
-    /// Called once from kernel `main()` before privilege drop.
-    pub fn init_task0(task_ram_base: u32) {
+    pub static mut TASKS: [Task; 1] = [EMPTY_TASK];
+
+    /// Populate task 0. Called once from kernel `main()` before privilege drop.
+    /// `ram_base` must be aligned to `ram_size` (MPU requirement); `ram_size`
+    /// must be a power of two ≥ 32.
+    pub fn init_task0(entry_pc: u32, ram_base: u32, ram_size: u32) {
         // SAFETY: called once at boot before any code can read TASKS.
         unsafe {
             let t = &raw mut TASKS[0];
+            (*t).entry_pc = entry_pc;
+            (*t).initial_psp = (ram_base + ram_size) & !7;
             (*t).regions[0] = TaskRegion {
-                base: task_ram_base,
-                size: 8 * 1024,
+                base: ram_base,
+                size: ram_size,
                 perms: PERM_RW,
             };
             (*t).regions[1] = TaskRegion {
@@ -496,6 +509,40 @@ unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
 }
 
 // =============================================================================
+// Kernel: privilege drop
+// =============================================================================
+//
+// `bootstrap_user` is the one-way trapdoor from kernel to user mode: load
+// the task's PSP, set CONTROL=(SPSEL=1, nPRIV=1), ISB, then bx into the
+// task entry. After this point the only path back to kernel code is via
+// SVC or an exception.
+//
+// In Phase 2C this same routine will be reused on the very first switch
+// to *any* task, by feeding it different Task entries. The signature also
+// makes it easier to extend later when each task needs MPU reprogramming.
+unsafe fn bootstrap_user(task: &task::Task) -> ! {
+    // All three values flow through compiler-picked input registers; the
+    // asm body never names a hardcoded register. Earlier versions used
+    // `movs r0, #3` for the CONTROL value, which silently broke whenever
+    // the compiler happened to pick `r0` for `{entry}` — the `movs`
+    // clobbered the entry address before the `bx`, jumping to address 3.
+    // (`options(noreturn)` forbids declaring `r0` as a clobber explicitly,
+    // so just don't touch r0 at all.)
+    unsafe {
+        core::arch::asm!(
+            "msr psp, {psp}",        // PSP = top of user stack
+            "msr control, {ctrl}",   // CONTROL = nPRIV(1) | SPSEL(1) = 3
+            "isb",                   // commit privilege change before next insn
+            "bx  {entry}",           // jump into user task (unprivileged, on PSP)
+            psp   = in(reg) task.initial_psp,
+            entry = in(reg) task.entry_pc,
+            ctrl  = in(reg) 3u32,
+            options(noreturn),
+        );
+    }
+}
+
+// =============================================================================
 // Kernel entry
 // =============================================================================
 #[entry]
@@ -507,34 +554,50 @@ fn main() -> ! {
     gpio::init_leds();
     defmt::info!("kernel: LEDs initialized (R=17 G=16 B=25)");
 
-    // ---- 1. MPU ----
-    let task_ram_base = &raw const TASK0_RAM as u32;
-    defmt::info!("kernel: TASK0_RAM @ 0x{:08x} (size 8 KiB)", task_ram_base);
+    // ---- 1. Populate the task table ----
+    //
+    // The Task entry holds entry_pc / initial_psp / regions. Both MPU
+    // configuration and privilege-drop will read from it below, so the
+    // table is the single source of truth for "what is task 0".
+    let task0_ram_base = &raw const TASK0_RAM as u32;
+    let task0_ram_size: u32 = 8 * 1024;
+    defmt::info!(
+        "kernel: TASK0_RAM @ 0x{:08x} (size {} B)",
+        task0_ram_base,
+        task0_ram_size,
+    );
+    task::init_task0(
+        task0_main as *const () as u32,
+        task0_ram_base,
+        task0_ram_size,
+    );
 
-    let task0_region = Region {
-        number: 0,
-        base: task_ram_base,
-        size_bytes: 8 * 1024,
-        attrs: RASR_AP_PRIV_RW_UNPRIV_RW | RASR_MEM_NORMAL | RASR_XN,
-    };
-    let flash_region = Region {
-        number: 1,
-        base: 0x1000_0000,
-        // 16 MiB covers the whole XIP window (RP2040 maps up to 16 MiB).
-        size_bytes: 16 * 1024 * 1024,
-        // Read-only + executable for both privilege levels — user task
-        // needs to run its own code, which lives in flash.
-        attrs: RASR_AP_PRIV_RO_UNPRIV_RO | RASR_MEM_NORMAL,
-    };
-    configure(&cp.MPU, &[task0_region, flash_region]);
+    // ---- 2. MPU (regions sourced from TASKS[0]) ----
+    //
+    // For now the MPU's RASR encoding is set inline; Phase 2C will move
+    // this into a `switch_to_task` helper that reprograms MPU on each
+    // context switch.
+    let t = task::current();
+    let mpu_regions = [
+        Region {
+            number: 0,
+            base: t.regions[0].base,
+            size_bytes: t.regions[0].size,
+            attrs: RASR_AP_PRIV_RW_UNPRIV_RW | RASR_MEM_NORMAL | RASR_XN,
+        },
+        Region {
+            number: 1,
+            base: t.regions[1].base,
+            size_bytes: t.regions[1].size,
+            // Read-only + executable for both privilege levels — user task
+            // needs to run its own code, which lives in flash.
+            attrs: RASR_AP_PRIV_RO_UNPRIV_RO | RASR_MEM_NORMAL,
+        },
+    ];
+    configure(&cp.MPU, &mpu_regions);
     defmt::info!("kernel: MPU configured (2 regions: task0 RAM, flash RX)");
 
-    // ---- 1b. Mirror the MPU regions into the task table so syscall ----
-    // ---- handlers can validate user-supplied pointers.            ----
-    task::init_task0(task_ram_base);
-    defmt::info!("kernel: task0 region table populated");
-
-    // ---- 2. SysTick heartbeat (~1 Hz off uncalibrated boot ROSC) ----
+    // ---- 3. SysTick heartbeat (~1 Hz off uncalibrated boot ROSC) ----
     cp.SYST.set_clock_source(SystClkSource::Core);
     cp.SYST.set_reload(6_500_000 - 1);
     cp.SYST.clear_current();
@@ -542,25 +605,11 @@ fn main() -> ! {
     cp.SYST.enable_interrupt();
     defmt::info!("kernel: SysTick armed");
 
-    // ---- 3. Drop to unprivileged thread mode and jump to user task ----
-    let task0_psp = (task_ram_base + 8 * 1024) & !7; // top of region, 8-byte aligned
-    let task0_entry = task0_main as *const () as u32;
+    // ---- 4. Drop to unprivileged thread mode and jump to user task ----
     defmt::info!(
-        "kernel: dropping to user task: entry=0x{:08x} PSP=0x{:08x}",
-        task0_entry,
-        task0_psp,
+        "kernel: dropping to task0: entry=0x{:08x} PSP=0x{:08x}",
+        t.entry_pc,
+        t.initial_psp,
     );
-
-    unsafe {
-        core::arch::asm!(
-            "msr psp, {psp}",       // PSP = top of user stack
-            "movs r0, #3",          // CONTROL = nPRIV(1) | SPSEL(1)
-            "msr control, r0",
-            "isb",                  // commit privilege change before next insn
-            "bx  {entry}",          // jump to user task (now unprivileged, on PSP)
-            psp   = in(reg) task0_psp,
-            entry = in(reg) task0_entry,
-            options(noreturn),
-        );
-    }
+    unsafe { bootstrap_user(t) }
 }
