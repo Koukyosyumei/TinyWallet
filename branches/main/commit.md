@@ -628,3 +628,16 @@ Primary development branch
 
 ---
 
+## Commit 69fc8320 — 2026-05-07 12:18 UTC
+
+### Branch Purpose
+Primary development branch
+
+### Previous Progress Summary
+
+
+### This Commit's Contribution
+salty Keypair + sign over IPC; diagnosed rp2040-hal bootrom AEABI helpers as common cause of mysterious HardFaults under crypto code; disable-intrinsics applied but not yet hardware-validated. README updated with full status table + roadmap; two new feedback memories pinned. Resume by flashing tiny-wallet.uf2 and testing printf 'p\n'.
+
+---
+

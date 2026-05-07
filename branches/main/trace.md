@@ -434,3 +434,9 @@ _[Checkpoint: 69fc827f — edited src/main.rs; edited Cargo.toml; edited Cargo.t
 [12:18:20] ACT: wrote README.md
 [12:18:40] ACT: Phase 4A vault built (salty ed25519 keypair, IPC-driven get-pubkey + sign). Diagnosed two related HardFault traps: (1) compiler-emitted __aeabi_memclr8 from rp2040-hal calls into boot ROM via rom-function-table at low addrs, ROM helpers misexecute on general crypto code → branch to SCS region → 3-blink HardFault. Fix: enable rp2040-hal/disable-intrinsics. (2) Earlier Phase 3B host_io [0u8; 64] same root cause. Both lessons saved in memory. Phase 4A code complete in src/main.rs but the disable-intrinsics fix awaiting hardware confirmation.
 [12:18:40] NOTE: TODO: flash current UF2, send 'p\n' and 'shello\n' via USB-CDC. If both return correct hex, commit Phase 4A. If still HardFault, dig further (possibly stack overflow inside salty's slow-motion path, or another rp2040-hal intrinsic that needs replacing).
+
+
+---
+_[Checkpoint: 69fc8320 — Phase 4A WIP: vault task + ed25519 + AEABI bootrom diagnosis]_
+---
+
