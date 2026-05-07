@@ -65,6 +65,7 @@ struct TaskRam(#[allow(dead_code)] [u8; 8192]);
 
 static mut TASK0_RAM: TaskRam = TaskRam([0; 8192]);
 static mut TASK1_RAM: TaskRam = TaskRam([0; 8192]);
+static mut TASK2_RAM: TaskRam = TaskRam([0; 8192]);
 
 // =============================================================================
 // Syscall ABI
@@ -79,6 +80,8 @@ const SYSCALL_LED: u32 = 2;
 const SYSCALL_YIELD: u32 = 3;
 const SYSCALL_SEND: u32 = 4;
 const SYSCALL_RECV: u32 = 5;
+const SYSCALL_USB_READ: u32 = 6;
+const SYSCALL_USB_WRITE: u32 = 7;
 
 /// Maximum bytes we'll copy in a single SEND/RECV. Bounds the validation
 /// surface and keeps the rendezvous logic simple.
@@ -144,6 +147,22 @@ fn sys_recv(buf: &mut [u8]) -> u32 {
     syscall2(SYSCALL_RECV, buf.as_mut_ptr() as u32, buf.len() as u32)
 }
 
+/// Read bytes from the USB-CDC RX buffer into `buf`. Blocks if no data
+/// is available; the kernel's USBCTRL_IRQ wakes the caller when the host
+/// next sends a packet. Returns the number of bytes written into `buf`.
+/// `0xFFFFFFFF` indicates a validation error.
+fn sys_usb_read(buf: &mut [u8]) -> u32 {
+    syscall2(SYSCALL_USB_READ, buf.as_mut_ptr() as u32, buf.len() as u32)
+}
+
+/// Write bytes to the USB-CDC TX buffer. Non-blocking: returns the
+/// number of bytes accepted (may be less than `buf.len()` if the TX
+/// buffer is full). Caller is expected to retry. `0xFFFFFFFF` indicates
+/// a validation error.
+fn sys_usb_write(buf: &[u8]) -> u32 {
+    syscall2(SYSCALL_USB_WRITE, buf.as_ptr() as u32, buf.len() as u32)
+}
+
 // =============================================================================
 // User task
 // =============================================================================
@@ -192,6 +211,43 @@ extern "C" fn task1_main() -> ! {
     }
 }
 
+extern "C" fn host_io_main() -> ! {
+    sys_print(b"hello host_io");
+    // Use MaybeUninit to avoid the compiler-emitted __aeabi_memclr8 call
+    // for `[0u8; 64]`. AEABI's memclr8 expects an 8-byte-aligned dest;
+    // our stack-allocated [u8; 64] only ends up 4-aligned, which is
+    // outside the spec for memclr8 and seems to mis-execute on this build.
+    // sys_usb_read fully overwrites bytes before we read them, so leaving
+    // the buffer uninitialized is sound.
+    let mut buf: core::mem::MaybeUninit<[u8; 64]> = core::mem::MaybeUninit::uninit();
+    let buf_ptr = buf.as_mut_ptr() as *mut u8;
+    loop {
+        let n = unsafe {
+            let slice = core::slice::from_raw_parts_mut(buf_ptr, 64);
+            sys_usb_read(slice)
+        };
+        if n == 0 || n == u32::MAX {
+            continue;
+        }
+        let n = n as usize;
+        let mut written = 0usize;
+        while written < n {
+            let r = unsafe {
+                let slice = core::slice::from_raw_parts(buf_ptr.add(written), n - written);
+                sys_usb_write(slice)
+            };
+            if r == u32::MAX {
+                break;
+            }
+            if r == 0 {
+                sys_yield();
+                continue;
+            }
+            written += r as usize;
+        }
+    }
+}
+
 // =============================================================================
 // Kernel: USB-CDC (host-facing serial port)
 // =============================================================================
@@ -216,14 +272,24 @@ mod usb_io {
     }
 
     /// Backing storage for the USB stack. Initialized once at boot, then
-    /// owned exclusively by the USBCTRL_IRQ handler. SAFETY relies on
-    /// USBCTRL_IRQ being the only code that touches these slots after
-    /// `init` returns — no nested IRQ, no preemption-aware sharing.
+    /// shared between USBCTRL_IRQ and the SVCall handlers (both at NVIC
+    /// priority 0 — neither preempts the other, so plain access is safe).
     pub static mut STATE: UsbState = UsbState {
         bus: MaybeUninit::uninit(),
         serial: MaybeUninit::uninit(),
         device: MaybeUninit::uninit(),
     };
+
+    /// Kernel RX ring buffer. The USB IRQ drains the OUT endpoint into here
+    /// on every poll(); SYSCALL_USB_READ pulls from here. This decoupling
+    /// is *load-bearing*: if the IRQ doesn't drain serial.read whenever
+    /// data is available, the OUT endpoint stays "full" and the USB
+    /// peripheral keeps the IRQ permanently asserted, starving every user
+    /// task. Diagnosed empirically in Phase 3B.
+    pub const RX_RING_SIZE: usize = 256;
+    pub static mut RX_RING: [u8; RX_RING_SIZE] = [0; RX_RING_SIZE];
+    pub static mut RX_HEAD: usize = 0; // next byte to consume
+    pub static mut RX_LEN: usize = 0; // valid bytes from RX_HEAD
 
     /// Initialize system clocks (XOSC + PLL_SYS @ 125 MHz + PLL_USB @ 48 MHz)
     /// and bring up the USB peripheral as a CDC-ACM device. Must be called
@@ -287,23 +353,81 @@ mod usb_io {
     }
 }
 
+/// Push bytes into the kernel RX ring. Drops the tail of `src` if the
+/// ring is full — for this PoC we accept loss when no consumer is
+/// keeping up; a more conservative kernel would NAK the host instead.
+unsafe fn rx_ring_push(src: &[u8]) {
+    unsafe {
+        let space = usb_io::RX_RING_SIZE - usb_io::RX_LEN;
+        let n = src.len().min(space);
+        for i in 0..n {
+            let pos = (usb_io::RX_HEAD + usb_io::RX_LEN + i) % usb_io::RX_RING_SIZE;
+            usb_io::RX_RING[pos] = src[i];
+        }
+        usb_io::RX_LEN += n;
+    }
+}
+
+/// Pop up to `dst_max` bytes from the RX ring into the user buffer at
+/// `dst_ptr`. Returns the number copied. Caller is responsible for
+/// having validated (dst_ptr, dst_max) against the calling task's
+/// regions — this helper writes through privileged kernel access.
+unsafe fn rx_ring_pop(dst_ptr: u32, dst_max: u32) -> u32 {
+    unsafe {
+        let n = usb_io::RX_LEN.min(dst_max as usize);
+        let dst = dst_ptr as *mut u8;
+        for i in 0..n {
+            let pos = (usb_io::RX_HEAD + i) % usb_io::RX_RING_SIZE;
+            dst.add(i).write_volatile(usb_io::RX_RING[pos]);
+        }
+        usb_io::RX_HEAD = (usb_io::RX_HEAD + n) % usb_io::RX_RING_SIZE;
+        usb_io::RX_LEN -= n;
+        n as u32
+    }
+}
+
 #[interrupt]
 fn USBCTRL_IRQ() {
-    // SAFETY: this IRQ is the unique writer of usb_io::STATE after init.
-    // It does not preempt itself (NVIC enforces), and PendSV/SysTick/SVCall
-    // never touch USB state.
+    // SAFETY: this IRQ shares NVIC priority with SVCall (both default 0),
+    // so neither preempts the other; PendSV is lowest priority and never
+    // touches USB state. Single-writer to usb_io statics in the runtime
+    // sense.
     unsafe {
         let serial_slot = &raw mut usb_io::STATE.serial;
         let device_slot = &raw mut usb_io::STATE.device;
         let serial = (*serial_slot).assume_init_mut();
         let device = (*device_slot).assume_init_mut();
 
-        if device.poll(&mut [serial]) {
-            let mut buf = [0u8; 64];
-            if let Ok(n) = serial.read(&mut buf) {
-                // Phase 3A: kernel-side echo. Phase 3B will route bytes
-                // through SYSCALL_USB_READ/WRITE to a user task instead.
-                let _ = serial.write(&buf[..n]);
+        if !device.poll(&mut [serial]) {
+            return;
+        }
+
+        // ALWAYS drain serial.read into the kernel RX ring, even if no
+        // task is waiting. If we don't drain, the OUT endpoint stays full,
+        // the USB peripheral keeps the IRQ pending, and the handler re-
+        // fires forever — no user task ever runs again.
+        // Always drain into the kernel RX ring — must drain serial.read
+        // every poll() or the OUT endpoint stays full and the IRQ pends
+        // forever.
+        let mut tmp = [0u8; 64];
+        if let Ok(n) = serial.read(&mut tmp) {
+            if n > 0 {
+                rx_ring_push(&tmp[..n]);
+            }
+        }
+
+        // If a task is parked waiting for USB bytes and we have buffered
+        // data, deliver it now and wake the task.
+        for idx in 0..task::N_TASKS {
+            let t = &raw mut task::TASKS[idx];
+            if let task::TaskState::BlockedOnUsbRead { out_ptr, max_len } = (*t).state {
+                if usb_io::RX_LEN > 0 {
+                    let n = rx_ring_pop(out_ptr, max_len);
+                    (*t).state = task::TaskState::Ready;
+                    poke_blocked_task_r0(idx, n);
+                    cortex_m::peripheral::SCB::set_pendsv();
+                }
+                break;
             }
         }
     }
@@ -415,6 +539,9 @@ mod task {
             msg_ptr: u32,
             msg_len: u32,
         },
+        /// Task called USB_READ and the USB driver had no bytes available.
+        /// Stays here until USBCTRL_IRQ delivers the next host packet.
+        BlockedOnUsbRead { out_ptr: u32, max_len: u32 },
     }
 
     pub struct Task {
@@ -436,7 +563,7 @@ mod task {
         pub state: TaskState,
     }
 
-    pub const N_TASKS: usize = 2;
+    pub const N_TASKS: usize = 3;
 
     const EMPTY: TaskRegion = TaskRegion { base: 0, size: 0, perms: 0 };
     const EMPTY_TASK: Task = Task {
@@ -460,6 +587,11 @@ mod task {
     /// `bootstrap_user(task0)` directly which loads `initial_psp` and `bx`s
     /// to `entry_pc`. After task 0's first yield, `saved_psp` is set by
     /// PendSV and `initial_psp` is no longer read.
+    ///
+    /// IMPORTANT: explicitly initializes `state` and unused regions —
+    /// TASKS may land in `.uninit`, which cortex-m-rt does NOT zero-init
+    /// at boot. Leaving `state` garbage causes pattern-match jumps into
+    /// the SCS region (HardFault with PC=0xExxxxxxx).
     pub fn init_task0(entry_pc: u32, ram_base: u32, ram_size: u32) {
         // SAFETY: called once at boot before any code can read TASKS.
         unsafe {
@@ -467,6 +599,7 @@ mod task {
             (*t).entry_pc = entry_pc;
             (*t).initial_psp = (ram_base + ram_size) & !7;
             (*t).saved_psp = 0; // unused until first yield
+            (*t).state = TaskState::Ready;
             (*t).regions[0] = TaskRegion {
                 base: ram_base,
                 size: ram_size,
@@ -477,14 +610,25 @@ mod task {
                 size: 16 * 1024 * 1024,
                 perms: PERM_RX,
             };
+            (*t).regions[2] = TaskRegion {
+                base: 0,
+                size: 0,
+                perms: 0,
+            };
+            (*t).regions[3] = TaskRegion {
+                base: 0,
+                size: 0,
+                perms: 0,
+            };
         }
     }
 
-    /// Populate task 1+. Unlike task 0, this task's first run goes through
-    /// PendSV's restore path — so we pre-seed the task's stack with a
-    /// well-formed exception frame plus 32 bytes of zeros for r4-r11. When
-    /// PendSV pops both, the hardware exception-return lands at `entry_pc`
-    /// in unprivileged thread mode.
+    /// Populate any task whose first run goes through PendSV's restore
+    /// path (i.e. anything other than task 0, which boots via
+    /// `bootstrap_user`). We pre-seed the task's stack with a well-formed
+    /// exception frame plus 32 bytes of zeros for r4-r11. When PendSV
+    /// pops both, the hardware exception-return lands at `entry_pc` in
+    /// unprivileged thread mode.
     ///
     /// Stack layout (grows down from `top`):
     ///
@@ -501,9 +645,11 @@ mod task {
     ///   -36..-64  r4-r11 = zeros   ── PendSV pops these first
     /// saved_psp  ──────────────  initial PSP value PendSV sees
     /// ```
-    pub fn init_task1(slot: usize, entry_pc: u32, ram_base: u32, ram_size: u32) {
+    pub fn init_task_with_frame(slot: usize, entry_pc: u32, ram_base: u32, ram_size: u32) {
         // SAFETY: called once at boot, single-threaded. Writes into the
         // task's RAM via privileged kernel access (PRIVDEFENA=1 in MPU).
+        // IMPORTANT: explicitly initializes `state` and unused regions —
+        // see init_task0 for why (TASKS may live in .uninit).
         unsafe {
             let t = &raw mut TASKS[slot];
             (*t).entry_pc = entry_pc;
@@ -527,6 +673,7 @@ mod task {
                 (saved_psp as *mut u32).add(i).write_volatile(0);
             }
             (*t).saved_psp = saved_psp;
+            (*t).state = TaskState::Ready;
 
             (*t).regions[0] = TaskRegion {
                 base: ram_base,
@@ -537,6 +684,16 @@ mod task {
                 base: 0x1000_0000,
                 size: 16 * 1024 * 1024,
                 perms: PERM_RX,
+            };
+            (*t).regions[2] = TaskRegion {
+                base: 0,
+                size: 0,
+                perms: 0,
+            };
+            (*t).regions[3] = TaskRegion {
+                base: 0,
+                size: 0,
+                perms: 0,
             };
         }
     }
@@ -848,6 +1005,51 @@ fn syscall_recv(out_ptr: u32, max_len: u32) -> u32 {
     0
 }
 
+/// Drain bytes from the kernel RX ring into the user task's buffer. If
+/// the ring is empty, park the caller; USBCTRL_IRQ will deliver to it
+/// when the next host packet arrives.
+fn syscall_usb_read(out_ptr: u32, max_len: u32) -> u32 {
+    if max_len == 0 || max_len > 256 {
+        return u32::MAX;
+    }
+    let cur = unsafe { task::CURRENT_TASK };
+    let cur_task = unsafe { &*(&raw const task::TASKS[cur]) };
+    if !task::validate_buf(cur_task, out_ptr, max_len, task::PERM_W) {
+        return u32::MAX;
+    }
+    unsafe {
+        if usb_io::RX_LEN > 0 {
+            return rx_ring_pop(out_ptr, max_len);
+        }
+    }
+    unsafe {
+        let cur_t = &raw mut task::TASKS[cur];
+        (*cur_t).state = task::TaskState::BlockedOnUsbRead { out_ptr, max_len };
+    }
+    cortex_m::peripheral::SCB::set_pendsv();
+    0
+}
+
+fn syscall_usb_write(in_ptr: u32, in_len: u32) -> u32 {
+    if in_len == 0 || in_len > 256 {
+        return u32::MAX;
+    }
+    let cur = unsafe { task::CURRENT_TASK };
+    let cur_task = unsafe { &*(&raw const task::TASKS[cur]) };
+    if !task::validate_buf(cur_task, in_ptr, in_len, task::PERM_R) {
+        return u32::MAX;
+    }
+    unsafe {
+        let serial_slot = &raw mut usb_io::STATE.serial;
+        let serial = (*serial_slot).assume_init_mut();
+        let user_buf = core::slice::from_raw_parts(in_ptr as *const u8, in_len as usize);
+        match serial.write(user_buf) {
+            Ok(n) => n as u32,
+            Err(_) => 0, // TX buffer full — caller retries
+        }
+    }
+}
+
 #[exception]
 unsafe fn SVCall() {
     // The exception was taken from unprivileged thread mode (the user task
@@ -875,6 +1077,8 @@ unsafe fn SVCall() {
         }
         SYSCALL_SEND => syscall_send(a1, a2, a3),
         SYSCALL_RECV => syscall_recv(a1, a2),
+        SYSCALL_USB_READ => syscall_usb_read(a1, a2),
+        SYSCALL_USB_WRITE => syscall_usb_write(a1, a2),
         _ => {
             defmt::warn!("kernel: unknown syscall {}", num);
             u32::MAX
@@ -920,18 +1124,49 @@ fn SysTick() {
 // violation from the user task, which is exactly what we want to demonstrate.
 #[exception]
 unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
+    let pc = ef.pc();
     defmt::error!(
-        "HardFault! pc=0x{:08x} lr=0x{:08x} xpsr=0x{:08x} — likely MPU violation from user task",
-        ef.pc(),
-        ef.lr(),
-        ef.xpsr(),
+        "HardFault! pc=0x{:08x} lr=0x{:08x} xpsr=0x{:08x}",
+        pc, ef.lr(), ef.xpsr(),
     );
-    // Visible signal: red LED solid, green + blue off. Without a debug
-    // probe attached, `bkpt` would itself escalate, so just halt cleanly
-    // with WFI.
     gpio::set(gpio::LED_GREEN, false);
     gpio::set(gpio::LED_BLUE, false);
     gpio::set(gpio::LED_RED, true);
+
+    // Diagnostic without a probe: blink BLUE N times based on the PC
+    // region, with a long pause first so the burst is unmistakable.
+    //   1 = PC in flash (0x10000000..)  → fault inside our code
+    //   2 = PC in RAM   (0x20000000..)  → executing data (bad jump)
+    //   3 = PC in SCS   (0xE0000000..)  → exception inside an exception
+    //   4 = other                       → jumped to garbage (e.g. addr 0)
+    let n = if (0x1000_0000..0x1020_0000).contains(&pc) {
+        1
+    } else if (0x2000_0000..0x2010_0000).contains(&pc) {
+        2
+    } else if pc >= 0xE000_0000 {
+        3
+    } else {
+        4
+    };
+
+    fn long_delay() {
+        for _ in 0..20_000_000 {
+            cortex_m::asm::nop();
+        }
+    }
+    fn short_delay() {
+        for _ in 0..3_000_000 {
+            cortex_m::asm::nop();
+        }
+    }
+    long_delay(); // pause so the burst is visually distinct
+    for _ in 0..n {
+        gpio::set(gpio::LED_BLUE, true);
+        short_delay();
+        gpio::set(gpio::LED_BLUE, false);
+        short_delay();
+    }
+
     loop {
         cortex_m::asm::wfi();
     }
@@ -1110,6 +1345,15 @@ fn main() -> ! {
     defmt::info!("tiny-wallet kernel: boot");
     let mut cp = Peripherals::take().unwrap();
 
+    // Explicitly initialize task scheduling state — TASKS and CURRENT_TASK
+    // landed at the .bss / .uninit boundary; cortex-m-rt only zero-inits
+    // .bss, so anything in .uninit holds whatever was in RAM at reset.
+    // Garbage TaskState discriminants make Rust's pattern-match jump to
+    // arbitrary addresses (e.g. SCS region → HardFault).
+    unsafe {
+        core::ptr::write_volatile(&raw mut task::CURRENT_TASK, 0);
+    }
+
     // ---- 0. On-board LEDs (kernel-owned, used as the visible status display) ----
     gpio::init_leds();
     defmt::info!("kernel: LEDs initialized (R=17 G=16 B=25)");
@@ -1131,11 +1375,13 @@ fn main() -> ! {
     // which init_task1 seeds with a fake exception frame).
     let task0_ram_base = &raw const TASK0_RAM as u32;
     let task1_ram_base = &raw const TASK1_RAM as u32;
+    let task2_ram_base = &raw const TASK2_RAM as u32;
     let task_ram_size: u32 = 8 * 1024;
     defmt::info!(
-        "kernel: TASK0_RAM @ 0x{:08x}, TASK1_RAM @ 0x{:08x} (each {} B)",
+        "kernel: TASK0_RAM=0x{:08x} TASK1_RAM=0x{:08x} TASK2_RAM=0x{:08x} (each {} B)",
         task0_ram_base,
         task1_ram_base,
+        task2_ram_base,
         task_ram_size,
     );
     task::init_task0(
@@ -1143,10 +1389,16 @@ fn main() -> ! {
         task0_ram_base,
         task_ram_size,
     );
-    task::init_task1(
+    task::init_task_with_frame(
         1,
         task1_main as *const () as u32,
         task1_ram_base,
+        task_ram_size,
+    );
+    task::init_task_with_frame(
+        2,
+        host_io_main as *const () as u32,
+        task2_ram_base,
         task_ram_size,
     );
 
@@ -1166,7 +1418,6 @@ fn main() -> ! {
             .set_priority(cortex_m::peripheral::scb::SystemHandler::PendSV, 0xFF);
     }
 
-    // ---- 4. SysTick heartbeat (~1 Hz at 125 MHz core) ----
     cp.SYST.set_clock_source(SystClkSource::Core);
     cp.SYST.set_reload(125_000_000 - 1);
     cp.SYST.clear_current();
