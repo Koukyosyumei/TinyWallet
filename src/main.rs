@@ -64,6 +64,12 @@ static mut TASK1_RAM: TaskRam = TaskRam([0; 8192]);
 const SYSCALL_PRINT: u32 = 1;
 const SYSCALL_LED: u32 = 2;
 const SYSCALL_YIELD: u32 = 3;
+const SYSCALL_SEND: u32 = 4;
+const SYSCALL_RECV: u32 = 5;
+
+/// Maximum bytes we'll copy in a single SEND/RECV. Bounds the validation
+/// surface and keeps the rendezvous logic simple.
+const IPC_MAX_BYTES: u32 = 64;
 
 #[inline(always)]
 fn syscall2(num: u32, a1: u32, a2: u32) -> u32 {
@@ -91,8 +97,38 @@ fn sys_set_led(which: u32, on: bool) {
 
 /// Cooperative yield: kernel pends PendSV, which (after this SVC returns)
 /// switches to the next ready task. Returns when this task is rescheduled.
+#[allow(dead_code)]
 fn sys_yield() {
     syscall2(SYSCALL_YIELD, 0, 0);
+}
+
+#[inline(always)]
+fn syscall3(num: u32, a1: u32, a2: u32, a3: u32) -> u32 {
+    let ret: u32;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("r0") num,
+            in("r1") a1,
+            in("r2") a2,
+            in("r3") a3,
+            lateout("r0") ret,
+        );
+    }
+    ret
+}
+
+/// Send a message to another task. Blocks the caller until the target is
+/// in `recv` to pick it up (synchronous rendezvous). Returns 0 on success.
+fn sys_send(target: u32, msg: &[u8]) -> u32 {
+    syscall3(SYSCALL_SEND, target, msg.as_ptr() as u32, msg.len() as u32)
+}
+
+/// Receive a message into `buf`. Blocks until some task sends to us.
+/// Returns a packed u32: low 16 bits = message length, bits 16..23 =
+/// sender task ID. `0xFFFFFFFF` indicates an error (e.g. invalid buffer).
+fn sys_recv(buf: &mut [u8]) -> u32 {
+    syscall2(SYSCALL_RECV, buf.as_mut_ptr() as u32, buf.len() as u32)
 }
 
 // =============================================================================
@@ -103,31 +139,41 @@ fn sys_yield() {
 //   - read+execute  flash             (so the task can run its own code)
 //   - read+write    its own 8 KiB RAM (TASK0_RAM)
 // Anything else — kernel RAM, peripherals — should fault.
+/// Task 0 — the **client**. Toggles the blue LED on its own loop, then
+/// every 4th iteration sends "ping" to task 1 and waits for the reply.
 extern "C" fn task0_main() -> ! {
-    sys_print(b"hello from task0");
+    sys_print(b"hello task0 (client)");
     let mut counter: u32 = 0;
+    let mut reply_buf = [0u8; 16];
     loop {
-        sys_set_led(2, counter & 1 == 0); // blue
+        sys_set_led(2, counter & 1 == 0); // blue toggle
         counter = counter.wrapping_add(1);
         for _ in 0..400_000 {
             unsafe { core::arch::asm!("nop") };
         }
-        sys_yield();
+        if counter.is_multiple_of(4) {
+            sys_send(1, b"ping");
+            let _ = sys_recv(&mut reply_buf);
+        }
     }
 }
 
+/// Task 1 — the **server**. Sits in `recv` waiting for requests; on each
+/// one, toggles the green LED and replies "pong". The fact that green
+/// blinks at all proves IPC delivery is happening — task 0 doesn't yield
+/// between pings, so without IPC task 1 would never run.
 extern "C" fn task1_main() -> ! {
-    sys_print(b"hello from task1");
+    sys_print(b"hello task1 (server)");
     let mut counter: u32 = 0;
+    let mut req_buf = [0u8; 16];
     loop {
-        sys_set_led(1, counter & 1 == 0); // green
+        let _ = sys_recv(&mut req_buf); // blocks until task 0 pings
+        sys_set_led(1, counter & 1 == 0); // green toggle
         counter = counter.wrapping_add(1);
-        // Different busy-wait length than task 0, so the rates visibly
-        // differ when both tasks are alive.
-        for _ in 0..600_000 {
+        for _ in 0..200_000 {
             unsafe { core::arch::asm!("nop") };
         }
-        sys_yield();
+        sys_send(0, b"pong");
     }
 }
 
@@ -221,6 +267,24 @@ mod task {
         pub perms: u8,
     }
 
+    /// Scheduling + IPC state. Phase 2D introduces blocking states; the
+    /// scheduler skips them when picking the next task to run.
+    #[derive(Clone, Copy)]
+    pub enum TaskState {
+        Ready,
+        /// Task called RECV and is parked waiting for some sender to target
+        /// it. `out_ptr` / `max_len` describe the buffer where the message
+        /// should be written when delivery happens.
+        BlockedOnRecv { out_ptr: u32, max_len: u32 },
+        /// Task called SEND and is parked because the target wasn't in
+        /// RECV. Stays here until the target's RECV picks up the message.
+        BlockedOnSend {
+            target: u8,
+            msg_ptr: u32,
+            msg_len: u32,
+        },
+    }
+
     pub struct Task {
         /// Function pointer the kernel jumps to when first running this task.
         pub entry_pc: u32,
@@ -236,6 +300,8 @@ mod task {
         /// MPU regions granted to this task, mirrored for syscall pointer
         /// validation. Empty entries (size == 0) are skipped.
         pub regions: [TaskRegion; 4],
+        /// Scheduler state; blocked tasks are skipped by `pick_next_ready`.
+        pub state: TaskState,
     }
 
     pub const N_TASKS: usize = 2;
@@ -246,6 +312,7 @@ mod task {
         initial_psp: 0,
         saved_psp: 0,
         regions: [EMPTY; 4],
+        state: TaskState::Ready,
     };
 
     pub static mut TASKS: [Task; N_TASKS] = [EMPTY_TASK; N_TASKS];
@@ -354,6 +421,22 @@ mod task {
             let idx = CURRENT_TASK;
             &*(&raw const TASKS[idx])
         }
+    }
+
+    /// Round-robin scheduler: starting after `current`, return the index
+    /// of the next Ready task. Wraps around. If no task is Ready (true
+    /// deadlock), panics.
+    pub fn pick_next_ready(current: usize) -> usize {
+        for i in 1..=N_TASKS {
+            let idx = (current + i) % N_TASKS;
+            if matches!(
+                unsafe { (*(&raw const TASKS[idx])).state },
+                TaskState::Ready
+            ) {
+                return idx;
+            }
+        }
+        panic!("scheduler: no Ready tasks");
     }
 
     /// Returns true iff `[ptr, ptr+len)` is fully inside one of the task's
@@ -496,6 +579,143 @@ fn syscall_led(which: u32, value: u32) -> u32 {
     0
 }
 
+/// Pack (sender, len) for return from RECV: low 16 bits = len,
+/// bits 16..23 = sender index.
+fn encode_recv_result(sender: u8, len: u32) -> u32 {
+    ((sender as u32) << 16) | (len & 0xFFFF)
+}
+
+/// Write the saved r0 slot of a *Blocked* task's exception frame so that
+/// when the task is later resumed, its in-flight syscall sees `value` as
+/// the return register.
+///
+/// The task must currently be Blocked (i.e. its full register state has
+/// been saved by PendSV and hasn't been popped back). Layout under the
+/// saved PSP: 32 bytes of r4-r11, then the 8-word HW exception frame.
+/// r0 lives at offset 32 from saved_psp.
+unsafe fn poke_blocked_task_r0(task_idx: usize, value: u32) {
+    unsafe {
+        let psp = (*(&raw const task::TASKS[task_idx])).saved_psp;
+        let r0_slot = (psp + 32) as *mut u32;
+        r0_slot.write_volatile(value);
+    }
+}
+
+fn syscall_send(target: u32, msg_ptr: u32, msg_len: u32) -> u32 {
+    let target = target as usize;
+    if target >= task::N_TASKS || msg_len > IPC_MAX_BYTES {
+        return u32::MAX;
+    }
+    let cur = unsafe { task::CURRENT_TASK };
+    if target == cur {
+        return u32::MAX; // self-send is meaningless and would deadlock
+    }
+    let cur_task = unsafe { &*(&raw const task::TASKS[cur]) };
+    if !task::validate_buf(cur_task, msg_ptr, msg_len, task::PERM_R) {
+        return u32::MAX;
+    }
+
+    // Snapshot the target's state once. If it's BlockedOnRecv, we deliver
+    // the message right now and wake it; otherwise we block the caller
+    // until the target eventually calls RECV.
+    let target_state = unsafe { (*(&raw const task::TASKS[target])).state };
+    match target_state {
+        task::TaskState::BlockedOnRecv {
+            out_ptr,
+            max_len,
+        } => {
+            let copy_len = msg_len.min(max_len);
+            // SAFETY: kernel is privileged (PRIVDEFENA=1), both buffers
+            // were validated against their owning task's regions when the
+            // tasks issued their respective syscalls.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    msg_ptr as *const u8,
+                    out_ptr as *mut u8,
+                    copy_len as usize,
+                );
+                let target_t = &raw mut task::TASKS[target];
+                (*target_t).state = task::TaskState::Ready;
+                // Deliver the recv result through the target's saved frame
+                // so its sys_recv call returns with the right value.
+                poke_blocked_task_r0(target, encode_recv_result(cur as u8, copy_len));
+            }
+            // Caller stays Ready; pend a switch so the freshly-Ready
+            // target gets a chance to run.
+            cortex_m::peripheral::SCB::set_pendsv();
+            0
+        }
+        _ => {
+            // Block caller. Its r4-r11 + exception frame will be saved by
+            // the PendSV that fires next; when the target eventually
+            // RECVs, that handler will copy from msg_ptr and wake us.
+            unsafe {
+                let cur_t = &raw mut task::TASKS[cur];
+                (*cur_t).state = task::TaskState::BlockedOnSend {
+                    target: target as u8,
+                    msg_ptr,
+                    msg_len,
+                };
+            }
+            cortex_m::peripheral::SCB::set_pendsv();
+            // The 0 we return here will be overwritten by the rendezvous
+            // handler before we ever resume — see poke_blocked_task_r0.
+            0
+        }
+    }
+}
+
+fn syscall_recv(out_ptr: u32, max_len: u32) -> u32 {
+    if max_len > IPC_MAX_BYTES {
+        return u32::MAX;
+    }
+    let cur = unsafe { task::CURRENT_TASK };
+    let cur_task = unsafe { &*(&raw const task::TASKS[cur]) };
+    if !task::validate_buf(cur_task, out_ptr, max_len, task::PERM_W) {
+        return u32::MAX;
+    }
+
+    // Look for a task already blocked-on-send-to-us. If found, deliver
+    // its message immediately and wake it.
+    for sender in 0..task::N_TASKS {
+        if sender == cur {
+            continue;
+        }
+        let sender_state = unsafe { (*(&raw const task::TASKS[sender])).state };
+        if let task::TaskState::BlockedOnSend {
+            target,
+            msg_ptr,
+            msg_len,
+        } = sender_state
+        {
+            if target as usize == cur {
+                let copy_len = msg_len.min(max_len);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        msg_ptr as *const u8,
+                        out_ptr as *mut u8,
+                        copy_len as usize,
+                    );
+                    let sender_t = &raw mut task::TASKS[sender];
+                    (*sender_t).state = task::TaskState::Ready;
+                    // Sender's sys_send will see 0 (success) when it resumes.
+                    poke_blocked_task_r0(sender, 0);
+                }
+                return encode_recv_result(sender as u8, copy_len);
+            }
+        }
+    }
+
+    // No pending sender — block caller.
+    unsafe {
+        let cur_t = &raw mut task::TASKS[cur];
+        (*cur_t).state = task::TaskState::BlockedOnRecv { out_ptr, max_len };
+    }
+    cortex_m::peripheral::SCB::set_pendsv();
+    // Will be overwritten by the rendezvous-on-send handler.
+    0
+}
+
 #[exception]
 unsafe fn SVCall() {
     // The exception was taken from unprivileged thread mode (the user task
@@ -508,6 +728,7 @@ unsafe fn SVCall() {
     let num = frame[0];
     let a1 = frame[1];
     let a2 = frame[2];
+    let a3 = frame[3];
 
     let ret = match num {
         SYSCALL_PRINT => syscall_print(a1, a2),
@@ -520,6 +741,8 @@ unsafe fn SVCall() {
             cortex_m::peripheral::SCB::set_pendsv();
             0
         }
+        SYSCALL_SEND => syscall_send(a1, a2, a3),
+        SYSCALL_RECV => syscall_recv(a1, a2),
         _ => {
             defmt::warn!("kernel: unknown syscall {}", num);
             u32::MAX
@@ -658,8 +881,9 @@ extern "C" fn pendsv_switch(outgoing_psp: u32) -> u32 {
         let tasks = &raw mut task::TASKS;
         (*tasks)[cur].saved_psp = outgoing_psp;
 
-        // Round-robin pick. Phase 2D could add Ready/Blocked states.
-        let next = (cur + 1) % task::N_TASKS;
+        // Round-robin pick that respects scheduling state — blocked tasks
+        // (waiting on IPC) are skipped.
+        let next = task::pick_next_ready(cur);
         task::CURRENT_TASK = next;
 
         let next_task = &(*tasks)[next];
