@@ -428,3 +428,4 @@ _[Checkpoint: 69fc1534 — edited Cargo.toml; edited src/main.rs; edited Cargo.t
 _[Checkpoint: 69fc827f — edited src/main.rs; edited Cargo.toml; edited Cargo.toml]_
 ---
 
+[12:17:06] ACT: wrote feedback_rp2040_hal_bootrom_aeabi.md
