@@ -497,3 +497,4 @@ _[Checkpoint: 69fd3a2a — edited README.md; edited README.md; edited README.md:
 [01:21:36] OBSERVE: read src/main.rs
 [01:23:08] THINK: Refactor src/main.rs (1567 lines) into modules. Layout: keep ISRs + #[entry] + bootstrap_user in main.rs, extract inline mod blocks to siblings (gpio.rs, usb.rs, task.rs, mpu.rs), split user-side syscall ABI to syscall.rs, kernel-side syscall handlers to kernel.rs, user tasks to user/{client,server,host_io,vault}.rs. Rejected alternative: distribute ISRs to domain modules — would scatter linker-relevant symbols and obscure the ISR landscape. Mitigations: build between each extraction; one module per commit ideally.
 [01:23:15] OBSERVE: read src/main.rs
+[01:23:19] OBSERVE: read src/main.rs
