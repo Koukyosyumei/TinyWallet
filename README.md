@@ -6,6 +6,9 @@ written in Rust as a microkernel demonstration. The goal isn't a production wall
 MPU-enforced privilege separation, syscall ABI, task isolation, kernel-mediated IPC,
 and a vault task whose secret key is unreachable from the host-facing code.
 
+New to OS / microkernel / embedded concepts? Start with [TUTORIAL.md](TUTORIAL.md)
+— it walks through every module from background-zero, assuming only basic Rust.
+
 ## Status
 
 | Phase | What it builds | Status |
