@@ -481,3 +481,4 @@ _[Checkpoint: 69fd391a — wrote README.md; Phase 4A vault built (salty ed25519 
 [01:18:50] OBSERVE: read README.md
 [01:18:54] ACT: edited README.md
 [01:19:02] OBSERVE: Phase 4A hardware test PASS: pubkey 7eb9...2714 (32B), sig 43fd...0d (64B). Python ed25519 verify confirms sig covers exactly b'hello\n' (6B incl. trailing newline from echo). disable-intrinsics fix works — no SCS-region HardFault.
+[01:19:02] ACT: edited README.md: Phase 4A and 4B → ✅ Hardware-validated; removed 'confirm Phase 4A on hardware' TODO
