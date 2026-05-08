@@ -517,3 +517,9 @@ _[Checkpoint: 69fd3a2a — edited README.md; edited README.md; edited README.md:
 _[Checkpoint: 69fd3dc9 — wrote src/user/vault.rs; wrote src/main.rs; split src/main.rs (1567 lines) into 11 files: main.rs (424 lines, ISRs+entry…]_
 ---
 
+
+
+---
+_[Checkpoint: 69fd3e4c — Refactor: src/main.rs split into 11 per-concern modules]_
+---
+

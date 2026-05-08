@@ -758,3 +758,16 @@ Primary development branch
 
 ---
 
+## Commit 69fd3e4c — 2026-05-08 01:37 UTC
+
+### Branch Purpose
+Primary development branch
+
+### Previous Progress Summary
+
+
+### This Commit's Contribution
+main.rs 1567->424 lines. New: syscall.rs, task.rs, gpio.rs, mpu.rs, usb.rs, kernel.rs, user/{client,server,host_io,vault}.rs. Hardware re-tested: pubkey + sig identical to pre-refactor. Committed 68d83a8f.
+
+---
+
