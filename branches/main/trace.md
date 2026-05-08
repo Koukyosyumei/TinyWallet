@@ -446,3 +446,9 @@ _[Checkpoint: 69fc8320 — Phase 4A WIP: vault task + ed25519 + AEABI bootrom di
 _[Checkpoint: 69fc847e — edited MEMORY.md; wrote README.md; Phase 4A vault built (salty ed25519 keypair, IPC-driven get-pubkey + sign). Diagnosed…]_
 ---
 
+
+
+---
+_[Checkpoint: 69fd3714 — edited MEMORY.md; wrote README.md; Phase 4A vault built (salty ed25519 keypair, IPC-driven get-pubkey + sign). Diagnosed…]_
+---
+
