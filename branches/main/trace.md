@@ -488,3 +488,9 @@ _[Checkpoint: 69fd391a — wrote README.md; Phase 4A vault built (salty ed25519 
 _[Checkpoint: 69fd3a1f — Phase 4A vault ed25519 hardware-validated]_
 ---
 
+
+
+---
+_[Checkpoint: 69fd3a2a — edited README.md; edited README.md; edited README.md: Phase 4A and 4B → ✅ Hardware-validated; removed 'confirm Phase 4A …]_
+---
+
