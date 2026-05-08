@@ -66,6 +66,7 @@ struct TaskRam(#[allow(dead_code)] [u8; 8192]);
 static mut TASK0_RAM: TaskRam = TaskRam([0; 8192]);
 static mut TASK1_RAM: TaskRam = TaskRam([0; 8192]);
 static mut TASK2_RAM: TaskRam = TaskRam([0; 8192]);
+static mut TASK3_RAM: TaskRam = TaskRam([0; 8192]);
 
 // =============================================================================
 // Syscall ABI
@@ -84,8 +85,9 @@ const SYSCALL_USB_READ: u32 = 6;
 const SYSCALL_USB_WRITE: u32 = 7;
 
 /// Maximum bytes we'll copy in a single SEND/RECV. Bounds the validation
-/// surface and keeps the rendezvous logic simple.
-const IPC_MAX_BYTES: u32 = 64;
+/// surface. Sized for the wallet's IPC: command bytes + payload (sign
+/// inputs) or response bytes (hex-encoded signature = 128 chars + slack).
+const IPC_MAX_BYTES: u32 = 256;
 
 #[inline(always)]
 fn syscall2(num: u32, a1: u32, a2: u32) -> u32 {
@@ -211,29 +213,48 @@ extern "C" fn task1_main() -> ! {
     }
 }
 
+/// Task 2 — `host_io`. Forwards bytes between USB-CDC and the vault task:
+/// USB bytes go to vault via IPC, vault's response goes back out USB.
+/// Doesn't interpret the protocol — the vault is the policy enforcer.
+///
+/// MaybeUninit avoids `__aeabi_memclr8` on the buffer (see commit
+/// ed95e928 — AEABI memclr8 mis-executes on non-8-aligned stack arrays).
 extern "C" fn host_io_main() -> ! {
     sys_print(b"hello host_io");
-    // Use MaybeUninit to avoid the compiler-emitted __aeabi_memclr8 call
-    // for `[0u8; 64]`. AEABI's memclr8 expects an 8-byte-aligned dest;
-    // our stack-allocated [u8; 64] only ends up 4-aligned, which is
-    // outside the spec for memclr8 and seems to mis-execute on this build.
-    // sys_usb_read fully overwrites bytes before we read them, so leaving
-    // the buffer uninitialized is sound.
-    let mut buf: core::mem::MaybeUninit<[u8; 64]> = core::mem::MaybeUninit::uninit();
+    let mut buf: core::mem::MaybeUninit<[u8; 256]> = core::mem::MaybeUninit::uninit();
     let buf_ptr = buf.as_mut_ptr() as *mut u8;
     loop {
+        // Read from USB.
         let n = unsafe {
-            let slice = core::slice::from_raw_parts_mut(buf_ptr, 64);
+            let slice = core::slice::from_raw_parts_mut(buf_ptr, 256);
             sys_usb_read(slice)
         };
         if n == 0 || n == u32::MAX {
             continue;
         }
         let n = n as usize;
+
+        // Forward to vault (task 3).
+        let _ = unsafe {
+            let slice = core::slice::from_raw_parts(buf_ptr, n);
+            sys_send(3, slice)
+        };
+
+        // Wait for the vault's response.
+        let recv_packed = unsafe {
+            let slice = core::slice::from_raw_parts_mut(buf_ptr, 256);
+            sys_recv(slice)
+        };
+        if recv_packed == u32::MAX {
+            continue;
+        }
+        let resp_len = (recv_packed & 0xFFFF) as usize;
+
+        // Write the response back out USB.
         let mut written = 0usize;
-        while written < n {
+        while written < resp_len {
             let r = unsafe {
-                let slice = core::slice::from_raw_parts(buf_ptr.add(written), n - written);
+                let slice = core::slice::from_raw_parts(buf_ptr.add(written), resp_len - written);
                 sys_usb_write(slice)
             };
             if r == u32::MAX {
@@ -246,6 +267,108 @@ extern "C" fn host_io_main() -> ! {
             written += r as usize;
         }
     }
+}
+
+/// Task 3 — `vault`. Holds the ed25519 keypair in MPU-isolated RAM
+/// (TASK3_RAM, only this task can read it directly). Receives commands
+/// from host_io via IPC, signs / responds, never exposes the secret.
+///
+/// Commands (first byte of message):
+///   'p'              → respond with hex-encoded public key (64 chars + '\n')
+///   's' <payload>    → respond with hex-encoded ed25519 signature over
+///                      `<payload>` (128 chars + '\n')
+///   anything else    → respond "?\n"
+/// Task 3 — `vault`. Holds the ed25519 keypair in MPU-isolated RAM
+/// (TASK3_RAM, only this task can read it directly). Receives commands
+/// from host_io via IPC, signs / responds, never exposes the secret.
+///
+/// Commands (first byte of message):
+///   'p'              → respond with hex-encoded public key (64 chars + '\n')
+///   's' <payload>    → respond with hex-encoded ed25519 signature over
+///                      `<payload>` (128 chars + '\n')
+///   anything else    → respond "?\n"
+extern "C" fn vault_main() -> ! {
+    sys_print(b"hello vault");
+
+    // Hardcoded seed for this PoC. The architectural property is that
+    // this value lives in vault's RAM, which only the vault's MPU view
+    // covers — host_io and other tasks cannot read it.
+    let seed_bytes: [u8; 32] = [
+        0x9E, 0x55, 0xD1, 0x3C, 0xA1, 0xF3, 0x40, 0x7B, 0xE2, 0x88, 0x91, 0x6F, 0x44, 0x0C, 0xDD,
+        0x21, 0x67, 0x05, 0x9A, 0xB7, 0x3D, 0xCE, 0xE8, 0x14, 0x52, 0xFB, 0xA4, 0x9D, 0x10, 0x77,
+        0xCC, 0x82,
+    ];
+    let keypair = salty::Keypair::from(&seed_bytes);
+
+    let mut req: core::mem::MaybeUninit<[u8; 256]> = core::mem::MaybeUninit::uninit();
+    let req_ptr = req.as_mut_ptr() as *mut u8;
+    let mut resp: core::mem::MaybeUninit<[u8; 256]> = core::mem::MaybeUninit::uninit();
+    let resp_ptr = resp.as_mut_ptr() as *mut u8;
+
+    loop {
+        let recv_packed = unsafe {
+            let slice = core::slice::from_raw_parts_mut(req_ptr, 256);
+            sys_recv(slice)
+        };
+        if recv_packed == u32::MAX {
+            continue;
+        }
+        let sender = ((recv_packed >> 16) & 0xFF) as u32;
+        let req_len = (recv_packed & 0xFFFF) as usize;
+        if req_len == 0 {
+            continue;
+        }
+
+        let cmd = unsafe { req_ptr.read() };
+        let resp_len = match cmd {
+            b'p' => {
+                let pk = keypair.public.to_bytes();
+                let n = unsafe {
+                    let dst = core::slice::from_raw_parts_mut(resp_ptr, 256);
+                    hex_encode(&pk, dst)
+                };
+                unsafe { resp_ptr.add(n).write(b'\n') };
+                n + 1
+            }
+            b's' => {
+                let payload = unsafe {
+                    core::slice::from_raw_parts(req_ptr.add(1), req_len.saturating_sub(1))
+                };
+                let sig = keypair.sign(payload);
+                let sig_bytes = sig.to_bytes();
+                let n = unsafe {
+                    let dst = core::slice::from_raw_parts_mut(resp_ptr, 256);
+                    hex_encode(&sig_bytes, dst)
+                };
+                unsafe { resp_ptr.add(n).write(b'\n') };
+                n + 1
+            }
+            _ => {
+                unsafe {
+                    resp_ptr.add(0).write(b'?');
+                    resp_ptr.add(1).write(b'\n');
+                }
+                2
+            }
+        };
+
+        let _ = unsafe {
+            let slice = core::slice::from_raw_parts(resp_ptr, resp_len);
+            sys_send(sender, slice)
+        };
+    }
+}
+
+/// Lower-case hex-encode `src` into `dst`. Returns the number of bytes
+/// written. Caller must size `dst` to at least `2 * src.len()`.
+fn hex_encode(src: &[u8], dst: &mut [u8]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let n = src.len().min(dst.len() / 2);
+    for i in 0..n {
+        dst[2 * i] = HEX[(src[i] >> 4) as usize];
+        dst[2 * i + 1] = HEX[(src[i] & 0x0F) as usize];
+    }
+    n * 2
 }
 
 // =============================================================================
@@ -563,7 +686,7 @@ mod task {
         pub state: TaskState,
     }
 
-    pub const N_TASKS: usize = 3;
+    pub const N_TASKS: usize = 4;
 
     const EMPTY: TaskRegion = TaskRegion { base: 0, size: 0, perms: 0 };
     const EMPTY_TASK: Task = Task {
@@ -1376,12 +1499,14 @@ fn main() -> ! {
     let task0_ram_base = &raw const TASK0_RAM as u32;
     let task1_ram_base = &raw const TASK1_RAM as u32;
     let task2_ram_base = &raw const TASK2_RAM as u32;
+    let task3_ram_base = &raw const TASK3_RAM as u32;
     let task_ram_size: u32 = 8 * 1024;
     defmt::info!(
-        "kernel: TASK0_RAM=0x{:08x} TASK1_RAM=0x{:08x} TASK2_RAM=0x{:08x} (each {} B)",
+        "kernel: TASK0_RAM=0x{:08x} TASK1_RAM=0x{:08x} TASK2_RAM=0x{:08x} TASK3_RAM=0x{:08x} (each {} B)",
         task0_ram_base,
         task1_ram_base,
         task2_ram_base,
+        task3_ram_base,
         task_ram_size,
     );
     task::init_task0(
@@ -1399,6 +1524,12 @@ fn main() -> ! {
         2,
         host_io_main as *const () as u32,
         task2_ram_base,
+        task_ram_size,
+    );
+    task::init_task_with_frame(
+        3,
+        vault_main as *const () as u32,
+        task3_ram_base,
         task_ram_size,
     );
 

@@ -26,11 +26,17 @@ rp2040-boot2 = "0.3"
 # RP2040 HAL — used for clock setup (XOSC + PLLs) and the UsbBus
 # implementation. Don't enable `critical-section-impl` here; cortex-m
 # already provides one and only one impl is allowed.
-rp2040-hal = { version = "0.12", features = ["rt"] }
+rp2040-hal = { version = "0.12", features = ["rt", "disable-intrinsics"] }
 
 # USB stack
 usb-device = "0.3"
 usbd-serial = "0.2"
+
+# ed25519 — `salty` is designed for Cortex-M (low stack, no alloc).
+# `ed25519-compact` HardFaulted during KeyPair::from_seed on our 8K
+# task stack — its scalar multiplication apparently blows past what we
+# have, or hits another alignment issue.
+salty = { version = "0.3", default-features = false, features = ["slow-motion"] }
 
 [profile.release]
 debug = 2

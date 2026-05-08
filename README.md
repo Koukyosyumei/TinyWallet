@@ -17,8 +17,8 @@ and a vault task whose secret key is unreachable from the host-facing code.
 | 2D    | Synchronous L4-style IPC (send / recv with rendezvous) | ✅ Hardware-validated |
 | 3A    | USB-CDC enumeration + clock-tree bring-up + kernel-side echo | ✅ Hardware-validated |
 | 3B    | host_io user task: USB bytes flow through syscalls + kernel RX ring buffer | ✅ Hardware-validated |
-| 4A    | Vault task with ed25519 (`salty`) keypair, IPC-driven get-pubkey + sign | 🟡 Built, last fix awaiting hardware confirmation |
-| 4B    | Sign command end-to-end + offline verification | ⏳ Next |
+| 4A    | Vault task with ed25519 (`salty`) keypair, IPC-driven get-pubkey + sign | ✅ Hardware-validated |
+| 4B    | Sign command end-to-end + offline verification | ✅ Hardware-validated (signature for `"hello\n"` verifies via Python `cryptography`) |
 | 4C    | User confirmation gating (button or USB-confirm) | ⏳ |
 | 5     | Persistent seed, real entropy, BIP32-style derivation, host protocol | ⏳ |
 
@@ -90,7 +90,6 @@ User-task MPU view: 8 KiB own RAM (RW), 16 MiB flash (RX). Anything else faults.
 
 ### Immediate next steps (resume here)
 
-- [ ] **Confirm Phase 4A on hardware.** The current build has `rp2040-hal/disable-intrinsics` enabled (boot-ROM AEABI helpers were causing HardFaults inside salty). Flash the produced UF2, `usbipd attach`, send `p\n`, expect 64 hex chars back. Send `shello\n`, expect 128 hex chars back. If both work, commit Phase 4A.
 - [ ] **Phase 4C — user confirmation.** XIAO's BOOT button isn't usable post-reset, so either (a) wire an external button to a GPIO pin and have vault block on it, or (b) implement a USB-side "send 'y' within N seconds to confirm" protocol. Option (b) doesn't have the same security properties as a physical button but demonstrates the architectural pattern.
 
 ### Cleanup that's been deferred
