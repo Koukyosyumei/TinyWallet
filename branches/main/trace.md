@@ -504,3 +504,4 @@ _[Checkpoint: 69fd3a2a — edited README.md; edited README.md; edited README.md:
 [01:29:24] ACT: wrote src/syscall.rs
 [01:30:12] ACT: wrote src/usb.rs
 [01:30:49] ACT: wrote src/kernel.rs
+[01:30:55] ACT: wrote src/user/mod.rs
