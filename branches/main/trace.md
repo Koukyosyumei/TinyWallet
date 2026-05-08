@@ -476,3 +476,4 @@ _[Checkpoint: 69fd38f3 — edited MEMORY.md; wrote README.md; Phase 4A vault bui
 _[Checkpoint: 69fd391a — wrote README.md; Phase 4A vault built (salty ed25519 keypair, IPC-driven get-pubkey + sign). Diagnosed two related HardF…]_
 ---
 
+[01:18:30] OBSERVE: read README.md
