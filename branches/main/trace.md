@@ -510,3 +510,4 @@ _[Checkpoint: 69fd3a2a — edited README.md; edited README.md; edited README.md:
 [01:31:25] ACT: wrote src/user/host_io.rs
 [01:31:47] ACT: wrote src/user/vault.rs
 [01:33:34] ACT: wrote src/main.rs
+[01:34:20] ACT: split src/main.rs (1567 lines) into 11 files: main.rs (424 lines, ISRs+entry+bootstrap), syscall.rs (94), task.rs (263), gpio.rs (60), mpu.rs (111), usb.rs (185), kernel.rs (207), user/{client,server,host_io,vault}.rs. cargo build --release clean, no warnings. UF2 same size 75264B. __aeabi_memclr8 still real compiler-builtins impl (no bootrom thunks regression).
