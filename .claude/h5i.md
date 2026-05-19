@@ -1,0 +1,177 @@
+## h5i Integration
+
+This repository uses **h5i** (a Git sidecar for AI-era version control).
+
+**Prefer MCP tools over Bash commands wherever possible.** h5i exposes native MCP tools (`h5i_context_trace`, `h5i_context_commit`, `h5i_commit`, `h5i_claims_add`, …) — they're faster and avoid shell-quoting pitfalls. Use `Bash: h5i …` only when no MCP tool covers the operation.
+
+h5i metadata lives in `refs/h5i/*` and is NOT pushed by plain `git push`. Use `h5i push` to share it.
+
+---
+
+## Rules — MUST follow
+
+Apply these automatically, without being asked.
+
+### Context workspace
+
+**At the start of every non-trivial task:**
+```bash
+h5i context status
+# If no workspace exists yet, initialize one:
+h5i context init --goal "<one-line summary of what you are about to do>"
+```
+
+**While working**, emit one trace entry per distinct insight or action.
+One OBSERVE per file read. One THINK per design decision. One ACT per file edited.
+A typical single-file task has 5–8 entries; multi-file tasks have more.
+
+```bash
+# One per file read — say what MATTERS, not just that you read it:
+h5i context trace --kind OBSERVE "<specific finding, constraint, or surprising detail>"
+
+# One per design decision — always include what you rejected and why:
+h5i context trace --kind THINK "<chosen approach> over <rejected alternative> because <reason>"
+# Bad:  "will add a mutex"   ← just a plan, no reasoning
+# Good: "inline mutex over OpenZeppelin — no external dep needed for a single guard"
+
+# One per file written or edited:
+h5i context trace --kind ACT "edited <file>: <what changed>"
+# If the implementation surprised you or diverged from THINK, note that here.
+
+# REQUIRED when any of these are true — do not skip:
+#   • you didn't handle an edge case you noticed
+#   • the approach has a known limitation
+#   • something is left for a follow-up
+h5i context trace --kind NOTE "TODO: … / LIMITATION: … / RISK: …"
+```
+
+**After completing a logical milestone** (analysis done, feature implemented, bug fixed):
+```bash
+h5i context commit "<milestone summary>" --detail "<what was done and what is left>"
+```
+
+**Branch your reasoning** when you want to explore an alternative without losing the current thread:
+```bash
+h5i context branch experiment/sync-retry --purpose "try sync retry as a simpler fallback"
+# ... explore ...
+h5i context checkout main                   # return to main reasoning branch
+h5i context merge experiment/sync-retry     # merge findings back if useful
+```
+
+**Before editing a non-trivial file**, surface prior reasoning that mentions it:
+```bash
+h5i context relevant src/repository.rs
+```
+
+---
+
+### Committing code
+
+**Always stage files before committing.** `h5i_commit` only commits what is staged and errors if nothing is staged.
+
+```bash
+git add <file1> <file2> …   # never `git add .`
+```
+
+Then commit via MCP (preferred):
+```
+h5i_commit(message="…", model="claude-sonnet-4-6", agent="claude-code", prompt="…")
+```
+
+Or via Bash if MCP is unavailable:
+```bash
+h5i commit -m "…" --model claude-sonnet-4-6 --agent claude-code --prompt "…"
+```
+
+Add flags when relevant:
+- `--tests`  — tests were added or modified (captures test metrics)
+- `--audit`  — security-sensitive, authentication, or high-risk changes
+
+Every `h5i commit` automatically snapshots the context workspace and links it to the git commit SHA, so the workspace state is recoverable per code commit (`h5i context restore <sha>`, `h5i context diff <sha1> <sha2>`).
+
+---
+
+### Claims — pin reusable facts
+
+`h5i claims` records content-addressed facts so future sessions don't re-derive them. Each claim pins a Merkle hash over its evidence files at HEAD; it stays **live** until any evidence blob changes, then auto-invalidates. Live claims are injected into the SessionStart prelude / `h5i context prompt` as pre-verified facts.
+
+**Two flavors, both stored as plain claims (only the length and path-count differ):**
+- **Cross-cutting fact** (~30 tokens, multiple paths). Example: *"HTTP only src/api/{client,auth,billing}.py."*
+- **Per-file orientation** (~80 tokens, single path) — replaces the deprecated `h5i summary`. Example: *"src/api/client.py | HTTP. fetch_user(id: int)→dict GET, create_post(...)→dict POST, delete_post(id: int)→bool DELETE. Logger \`log\` top."*
+
+**Record a claim when you have just established a non-obvious fact a future session would otherwise re-derive** — "X lives only in Y", "module M owns concern N", a subtle invariant, the public API of a struct, where *not* to look. Don't pin trivia a quick grep would answer.
+
+Prefer the MCP tool:
+```
+h5i_claims_add(
+  text="HTTP only src/api/client.py: fetch_user, create_post, delete_post.",
+  paths=["src/api/client.py"]
+)
+h5i_claims_list()       # → {claims: [...], live: N, stale: M}
+h5i_claims_prune()      # → {removed: N}
+```
+
+Or via Bash:
+```bash
+h5i claims add "HTTP only src/api/client.py: fetch_user, create_post, delete_post." \
+  --path src/api/client.py
+h5i claims list                  # all claims, flat
+h5i claims list --group-by-path  # claims grouped by file ("what's known about each file")
+h5i claims prune                 # drop claims whose evidence changed
+```
+
+**Evidence-path rule — the single most important thing to get right:**
+Pick the *minimum* set of files whose content, if edited, should cause the claim to be re-checked. Ask: *"If I changed file X, would this claim's truth be in doubt?"* If no, do not include X — even if you read X while establishing the claim.
+
+Why: the claim auto-invalidates the moment *any* evidence blob changes. Over-listing guarantees rapid staleness from unrelated edits and trains future sessions to distrust claims.
+
+Concrete example. Claim: *"HTTP only in `src/api/client.py`"*.
+- ✔ Good: `--path src/api/client.py` (one path). If client.py changes, re-check. Edits to formatters/validators/main.py do not affect the truth of this claim.
+- ✖ Bad: `--path src/api/client.py --path src/utils/format.py --path main.py`. Goes stale the next time someone touches an unrelated helper — even though the claim was still true.
+
+Rule of thumb: **most good claims cite 1 file; >3 is a red flag** you're confusing "files I read" with "files that back the claim".
+
+**Other rules:**
+- Evidence paths must be tracked in HEAD.
+- If the SessionStart prelude already shows a claim covering what you were about to investigate, trust it — don't re-read the files unless the user asks.
+- If a live claim is wrong, fix it: `h5i claims prune` removes only stale ones; you can also delete the JSON in `.git/.h5i/claims/` directly to remove a wrong-but-live claim.
+
+**Write claim text in caveman style.**
+- Cross-cutting: ~30 tokens. Per-file orientation: ~80 tokens.
+- Drop articles, copulas, fluff. Keep paths, identifier names, types, numeric constants exact.
+- Live claims are re-read on every cached-prefix turn forever — every word costs forever.
+
+| | Bloated (don't) | Caveman (do) |
+|---|---|---|
+| Cross-cutting | "All HTTP-making functions in this project live only in src/api/client.py (fetch_user, create_post, delete_post). main.py and src/utils/* contain no direct HTTP." | "HTTP only src/api/client.py: fetch_user, create_post, delete_post. main.py + utils/* no HTTP." |
+| Per-file | "The src/api/client.py file is an HTTP client module that uses the requests library to call the example API. It exports three functions and a logger." | "src/api/client.py \\| HTTP. requests to api.example.com. fetch_user(id: int)→dict GET, create_post(...)→dict POST, delete_post(id: int)→bool DELETE. Logger \\`log\\` top." |
+| Invariant | "The session token must be validated using a constant-time comparison to avoid timing attacks." | "Session token: constant-time compare. Timing attack risk." |
+
+**Frequency knob (`$H5I_CLAIMS_FREQUENCY`)** — the user can tune how eagerly you record claims:
+- `off` — do not record any this session, even if one would normally be warranted.
+- `low` (default) — only non-obvious, genuinely reusable facts.
+- `high` — record liberally; pin any reusable codebase insight. The evidence-path rule applies *especially* here.
+
+The SessionStart prelude prints the active policy when it is `off` or `high`. Follow the most recent policy line you see, even if it contradicts this base guidance.
+
+---
+
+### Memory Snapshots
+
+After a significant Claude Code session, snapshot Claude's memory so it can be shared or restored:
+
+```bash
+h5i memory snapshot        # snapshot current ~/.claude/projects/<repo>/memory/ → HEAD
+h5i memory log             # list all snapshots
+h5i memory diff            # show what changed since the previous snapshot
+h5i memory restore <oid>   # restore memory to the state at a given commit
+```
+
+---
+
+### Sharing h5i Data
+
+```bash
+h5i push   # push all h5i refs to origin
+h5i pull   # pull h5i refs from origin
+```

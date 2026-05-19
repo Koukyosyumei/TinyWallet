@@ -11,23 +11,33 @@ test = false
 bench = false
 
 [dependencies]
+# Logging over RTT
 defmt = "1.0"
 defmt-rtt = "1.1"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 
-embedded-hal = "1.0.0"
-embedded-hal-async = "1.0.0"
-embedded-io = "0.7"
-embedded-io-async = "0.7"
-embedded-storage = "0.3.1"
+# Cortex-M runtime + low-level access
+cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7.3"
 
-embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread", "defmt", "executor-interrupt"] }
-embassy-sync = { version = "0.7" }
-embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+# RP2040 boot stage 2 (just a 256-byte XIP setup blob)
+rp2040-boot2 = "0.3"
 
-cortex-m = { version = "0.7.7" }
-embassy-rp = { version = "0.9", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
+# RP2040 HAL — used for clock setup (XOSC + PLLs) and the UsbBus
+# implementation. Don't enable `critical-section-impl` here; cortex-m
+# already provides one and only one impl is allowed.
+rp2040-hal = { version = "0.12", features = ["rt", "disable-intrinsics"] }
+
+# USB stack
+usb-device = "0.3"
+usbd-serial = "0.2"
+
+# ed25519 — `salty` is designed for Cortex-M (low stack, no alloc).
+# `ed25519-compact` HardFaulted during KeyPair::from_seed on our 8K
+# task stack — its scalar multiplication apparently blows past what we
+# have, or hits another alignment issue.
+salty = { version = "0.3", default-features = false, features = ["slow-motion"] }
+
 [profile.release]
 debug = 2
 lto = true
